@@ -1,76 +1,112 @@
-name: YouTube → Highlight → Drive
+name: YouTube-Highlight-Drive
 
 on:
   workflow_dispatch:
     inputs:
       videoId:
         description: "YouTube video ID"
-        required: true 
+        required: true
 
 jobs:
   highlight:
     runs-on: ubuntu-latest
-
-    env:
-      GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
-      GDRIVE_PATH: ${{ secrets.GDRIVE_PATH }}
-      RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
-      MAKE_WEBHOOK: ${{ secrets.MAKE_WEBHOOK }}
-      YT_COOKIES: ${{ secrets.YT_COOKIES }}
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system deps (ffmpeg + fonts + rclone)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          pip install --upgrade pip
-          pip install yt-dlp==2024.12.13 faster-whisper==1.0.3 rclone requests
+          sudo apt-get install -y ffmpeg fonts-noto-cjk rclone
+          curl -L "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf" -o ./NotoNaskhArabic-Regular.ttf
 
-      - name: Restore rclone.conf
-        run: |
-          echo "${RCLONE_CONFIG_B64}" | base64 --decode > ~/.config/rclone/rclone.conf
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Download YouTube video
+      - name: Install Python requirements
         run: |
-          if [ -n "${YT_COOKIES}" ]; then
-            echo "${YT_COOKIES}" > cookies.txt
-            yt-dlp "https://www.youtube.com/watch?v=${{ inputs.videoId }}" \
-              --cookies cookies.txt -o "video.%(ext)s"
-          else
-            yt-dlp "https://www.youtube.com/watch?v=${{ inputs.videoId }}" -o "video.%(ext)s"
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Restore rclone config from secret
+        env:
+          RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG_CONTENTS }}
+        run: |
+          if [ -z "${RCLONE_CONFIG_CONTENTS}" ]; then
+            echo "Missing secret RCLONE_CONFIG_CONTENTS"; exit 1
           fi
+          mkdir -p ~/.config/rclone
+          printf "%s\n" "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
+          rclone listremotes || true
 
-      - name: Transcribe with Whisper
+      - name: Resolve inputs
+        id: meta
         run: |
-          python - <<'PY'
-from faster_whisper import WhisperModel
-import sys
-model = WhisperModel("large-v3", device="cpu", compute_type="int8")
-segments, _ = model.transcribe("video.mp4", language="ar")
-with open("subtitles.srt", "w", encoding="utf-8") as f:
-    for seg in segments:
-        f.write(f"{int(seg.start)} --> {int(seg.end)}\n{seg.text}\n\n")
-PY
+          echo "videoId=${{ inputs.videoId }}" >> $GITHUB_OUTPUT
 
-      - name: Upload to Google Drive
+      - name: Download source video (yt-dlp with optional cookies + fallback)
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          rclone copy video.mp4 "${GDRIVE_REMOTE}:${GDRIVE_PATH}"
+          set -e
+          VIDEO_ID='${{ steps.meta.outputs.videoId }}'
+          if [ -n "${YT_COOKIES}" ]; then
+            echo "Using cookies.txt from secret"
+            printf "%s\n" "${YT_COOKIES}" > cookies.txt
+            COOKIES_OPT="--cookies cookies.txt"
+          else
+            COOKIES_OPT=""
+          fi
+          # Try Android client first (often bypasses bot checks), then fallback once
+          yt-dlp $COOKIES_OPT --extractor-args "youtube:player_client=android" \
+            -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+            "https://www.youtube.com/watch?v=${VIDEO_ID}" || \
+          yt-dlp $COOKIES_OPT \
+            -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+            "https://www.youtube.com/watch?v=${VIDEO_ID}"
+          ls -lah
 
-      - name: Callback to Make.com
+      - name: Transcribe + select highlight + burn subs
+        run: |
+          python scripts/process_video.py \
+            --input input.mp4 \
+            --min-seconds 30 \
+            --max-seconds 60 \
+            --lang ar \
+            --keywords-prefer "قصة,مهم,نصيحة,أفضل,ضحك,سر,خطأ,نجاح,تجربة,لقطة" \
+            --keywords-avoid "إعلان,موسيقى,مقدمة,خاتمة" \
+            --font ./NotoNaskhArabic-Regular.ttf
+
+      - name: Upload to Google Drive (rclone)
+        env:
+          GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
+          GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
+        run: |
+          set -e
+          START=$(python -c 'import json;print(json.load(open("artifact.json"))["start"])')
+          END=$(python -c 'import json;print(json.load(open("artifact.json"))["end"])')
+          OUTFILE=$(python -c 'import json;print(json.load(open("artifact.json"))["outfile"])')
+          DEST="${GDRIVE_REMOTE}:${GDRIVE_PATH%/}/${{ steps.meta.outputs.videoId }}_${START}-${END}.mp4"
+          echo "Uploading $OUTFILE → $DEST"
+          rclone copy "$OUTFILE" "$DEST" --progress
+          echo "rclone upload OK ✅"
+
+      - name: Callback to Make.com (optional)
         if: always()
+        env:
+          MAKE_WEBHOOK: ${{ secrets.MAKE_WEBHOOK }}
         run: |
           python - <<'PY'
-import json, requests, os
-payload = {
-  "videoId": "${{ inputs.videoId }}",
-  "status": "success" if os.path.exists("video.mp4") else "failed"
-}
+import json,requests,os
+status = "success" if os.path.exists("artifact.json") else "failed"
+payload = {"videoId": "${{ steps.meta.outputs.videoId }}", "status": status}
 if os.path.exists("artifact.json"):
-  payload.update(json.load(open('artifact.json')))
-url = os.getenv('MAKE_WEBHOOK')
+  payload.update(json.load(open("artifact.json")))
+url = os.getenv("MAKE_WEBHOOK")
 if url:
   try:
     r = requests.post(url, json=payload, timeout=20)
