@@ -95,29 +95,3 @@ jobs:
           echo "Uploading $OUTFILE → $DEST"
           rclone copy "$OUTFILE" "$DEST" --progress
           echo "rclone upload OK ✅"
-
-      - name: Callback to Make.com (optional)
-        if: always()
-        env:
-          MAKE_WEBHOOK: ${{ secrets.MAKE_WEBHOOK }}
-        run: |
-          python - <<'PY'
-import json
-import requests
-import os
-
-status = "success" if os.path.exists("artifact.json") else "failed"
-payload = {"videoId": "${{ steps.meta.outputs.videoId }}", "status": status}
-if os.path.exists("artifact.json"):
-    payload.update(json.load(open("artifact.json")))
-
-url = os.getenv("MAKE_WEBHOOK")
-if url:
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        print("Callback status:", r.status_code)
-    except Exception as e:
-        print("Callback error:", e)
-else:
-    print("MAKE_WEBHOOK not set; skipping callback.")
-PY
