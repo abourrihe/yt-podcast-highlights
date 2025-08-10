@@ -1,11 +1,15 @@
-name: YouTube Highlight Drive (smoke)
+name: YouTube Highlight Drive (inputs test)
 
 on:
   workflow_dispatch:
+    inputs:
+      videoId:
+        description: "YouTube video ID"
+        required: true
 
 jobs:
-  hello:
+  echo-input:
     runs-on: ubuntu-latest
     steps:
-      - name: Say hello
-        run: echo "Actions are working"
+      - name: Print videoId
+        run: echo "videoId=${{ inputs.videoId }}"
