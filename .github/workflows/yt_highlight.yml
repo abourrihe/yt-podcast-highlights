@@ -12,6 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    env:
+      FONT_URL: https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf
+      GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
+      GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -20,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-noto-cjk rclone
-          curl -L "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf" -o ./NotoNaskhArabic-Regular.ttf
+          curl -L "$FONT_URL" -o ./NotoNaskhArabic-Regular.ttf
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -61,7 +66,6 @@ jobs:
           else
             COOKIES_OPT=""
           fi
-          # Try Android client first (often bypasses bot checks), then fallback once
           yt-dlp $COOKIES_OPT --extractor-args "youtube:player_client=android" \
             -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
             "https://www.youtube.com/watch?v=${VIDEO_ID}" || \
@@ -82,9 +86,6 @@ jobs:
             --font ./NotoNaskhArabic-Regular.ttf
 
       - name: Upload to Google Drive (rclone)
-        env:
-          GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
-          GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
         run: |
           set -e
           START=$(python -c 'import json;print(json.load(open("artifact.json"))["start"])')
@@ -101,18 +102,22 @@ jobs:
           MAKE_WEBHOOK: ${{ secrets.MAKE_WEBHOOK }}
         run: |
           python - <<'PY'
-import json,requests,os
+import json
+import requests
+import os
+
 status = "success" if os.path.exists("artifact.json") else "failed"
 payload = {"videoId": "${{ steps.meta.outputs.videoId }}", "status": status}
 if os.path.exists("artifact.json"):
-  payload.update(json.load(open("artifact.json")))
+    payload.update(json.load(open("artifact.json")))
+
 url = os.getenv("MAKE_WEBHOOK")
 if url:
-  try:
-    r = requests.post(url, json=payload, timeout=20)
-    print("Callback status:", r.status_code)
-  except Exception as e:
-    print("Callback error:", e)
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        print("Callback status:", r.status_code)
+    except Exception as e:
+        print("Callback error:", e)
 else:
-  print("MAKE_WEBHOOK not set; skipping callback.")
+    print("MAKE_WEBHOOK not set; skipping callback.")
 PY
