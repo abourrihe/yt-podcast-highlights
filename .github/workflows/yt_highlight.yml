@@ -1,23 +1,23 @@
-name: YouTube Highlight Drive (install test)
+name: YouTube Highlight Drive (rclone test)
 
 on:
   workflow_dispatch:
     inputs:
       videoId:
-        description: "YouTube video ID (just to keep the input UI)"
+        description: "YouTube video ID (not used in this test)"
         required: true
 
 jobs:
-  setup-and-install:
+  setup-install-and-rclone:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install system deps (ffmpeg + fonts)
+      - name: Install system deps (ffmpeg + fonts + rclone)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-cjk
+          sudo apt-get install -y ffmpeg fonts-noto-cjk rclone
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,11 +26,23 @@ jobs:
 
       - name: Install Python requirements
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      - name: Verify installs
+      # --- rclone config restore + test ---
+      - name: Restore rclone config from secret
         run: |
-          ffmpeg -version | head -n 1
-          python --version
-          python -c "import faster_whisper, pysrt; print('Python deps OK')"
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_CONTENTS }}" > ~/.config/rclone/rclone.conf
+          # basic sanity check: show remotes
+          rclone listremotes
+
+      - name: Test Drive access (list destination folder)
+        env:
+          GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
+          GDRIVE_PATH: ${{ secrets.GDRIVE_PATH }}
+        run: |
+          echo "Listing: ${GDRIVE_REMOTE}:${GDRIVE_PATH}"
+          rclone lsd "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}" || rclone mkdir "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}"
+          rclone lsd "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}"
+          echo "rclone OK"
