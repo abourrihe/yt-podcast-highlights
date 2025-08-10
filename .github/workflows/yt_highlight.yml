@@ -1,4 +1,4 @@
-name: YouTube → Highlight → Drive
+name: YouTube-Highlight-Drive
 
 on:
   workflow_dispatch:
@@ -7,19 +7,19 @@ on:
         description: "YouTube video ID"
         required: true
       title:
-        description: "Title"
+        description: "Title (unused)"
         required: true
         default: "Test"
       channel:
-        description: "Channel name"
+        description: "Channel name (unused)"
         required: true
         default: "Test"
       channelId:
-        description: "Channel ID (UC...)"
+        description: "Channel ID (unused)"
         required: true
         default: "UC0000000000000000000000"
       publishedAt:
-        description: "ISO time"
+        description: "ISO time (unused)"
         required: true
         default: "2024-01-01T00:00:00Z"
 
@@ -27,7 +27,6 @@ env:
   FONT_URL: https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf
   GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
   GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
-  MAKE_WEBHOOK:  ${{ secrets.MAKE_WEBHOOK }}
 
 jobs:
   highlight:
@@ -65,10 +64,6 @@ jobs:
         id: meta
         run: |
           echo "videoId=${{ inputs.videoId }}" >> $GITHUB_OUTPUT
-          echo "title=${{ inputs.title }}" >> $GITHUB_OUTPUT
-          echo "channel=${{ inputs.channel }}" >> $GITHUB_OUTPUT
-          echo "channelId=${{ inputs.channelId }}" >> $GITHUB_OUTPUT
-          echo "publishedAt=${{ inputs.publishedAt }}" >> $GITHUB_OUTPUT
 
       - name: Download source video (yt-dlp)
         run: |
@@ -92,41 +87,11 @@ jobs:
         run: |
           set -e
           VIDEO_ID='${{ steps.meta.outputs.videoId }}'
-          # read artifact info from script
           START=$(python -c 'import json;print(json.load(open("artifact.json"))["start"])')
           END=$(python -c 'import json;print(json.load(open("artifact.json"))["end"])')
           OUTFILE=$(python -c 'import json;print(json.load(open("artifact.json"))["outfile"])')
-          SAFE_CH=$(python - <<'PY'
-from slugify import slugify
-print(slugify("${{ steps.meta.outputs.channel }}", lowercase=False, regex_pattern=r"[^-\w\s]"))
-PY
-)
-          DEST="${GDRIVE_REMOTE}:${GDRIVE_PATH%/}/${SAFE_CH}_${VIDEO_ID}_${START}-${END}.mp4"
+          # keep filename simple to avoid quoting issues for now
+          DEST="${GDRIVE_REMOTE}:${GDRIVE_PATH%/}/${VIDEO_ID}_${START}-${END}.mp4"
           echo "Uploading $OUTFILE → $DEST"
           rclone copy "$OUTFILE" "$DEST" --progress
-          echo "rclone upload OK"
-
-      - name: (Optional) Callback to Make.com
-        if: always()
-        run: |
-          python - <<'PY'
-import json,requests,os
-payload = {
-  "videoId": "${{ steps.meta.outputs.videoId }}",
-  "title": "${{ steps.meta.outputs.title }}",
-  "channel": "${{ steps.meta.outputs.channel }}",
-  "channelId": "${{ steps.meta.outputs.channelId }}",
-  "publishedAt": "${{ steps.meta.outputs.publishedAt }}",
-  "status": "success" if os.path.exists("artifact.json") else "failed"
-}
-if os.path.exists("artifact.json"):
-  payload.update(json.load(open("artifact.json")))
-if os.getenv("MAKE_WEBHOOK"):
-  try:
-    r = requests.post(os.getenv("MAKE_WEBHOOK"), json=payload, timeout=20)
-    print("Callback status:", r.status_code)
-  except Exception as e:
-    print("Callback error:", e)
-else:
-  print("MAKE_WEBHOOK not set; skipping callback.")
-PY
+          echo "rclone upload OK ✅"
