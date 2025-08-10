@@ -7,19 +7,19 @@ on:
         description: "YouTube video ID"
         required: true
       title:
-        description: "Title (unused)"
+        description: "Title (optional)"
         required: true
         default: "Test"
       channel:
-        description: "Channel name (unused)"
+        description: "Channel name (optional)"
         required: true
         default: "Test"
       channelId:
-        description: "Channel ID (unused)"
+        description: "Channel ID (optional)"
         required: true
         default: "UC0000000000000000000000"
       publishedAt:
-        description: "ISO time (unused)"
+        description: "ISO time (optional)"
         required: true
         default: "2024-01-01T00:00:00Z"
 
@@ -27,6 +27,7 @@ env:
   FONT_URL: https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf
   GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
   GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
+  MAKE_WEBHOOK:  ${{ secrets.MAKE_WEBHOOK }}
 
 jobs:
   highlight:
@@ -56,6 +57,9 @@ jobs:
         env:
           RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG_CONTENTS }}
         run: |
+          if [ -z "${RCLONE_CONFIG_CONTENTS}" ]; then
+            echo "Missing secret RCLONE_CONFIG_CONTENTS"; exit 1
+          fi
           mkdir -p ~/.config/rclone
           printf "%s\n" "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
           rclone listremotes || true
@@ -64,12 +68,31 @@ jobs:
         id: meta
         run: |
           echo "videoId=${{ inputs.videoId }}" >> $GITHUB_OUTPUT
+          echo "title=${{ inputs.title }}" >> $GITHUB_OUTPUT
+          echo "channel=${{ inputs.channel }}" >> $GITHUB_OUTPUT
+          echo "channelId=${{ inputs.channelId }}" >> $GITHUB_OUTPUT
+          echo "publishedAt=${{ inputs.publishedAt }}" >> $GITHUB_OUTPUT
 
-      - name: Download source video (yt-dlp)
+      - name: Download source video (yt-dlp with optional cookies + fallback)
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           set -e
           VIDEO_ID='${{ steps.meta.outputs.videoId }}'
-          yt-dlp -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" "https://www.youtube.com/watch?v=${VIDEO_ID}"
+          if [ -n "${YT_COOKIES}" ]; then
+            echo "Using cookies.txt from secret"
+            printf "%s\n" "${YT_COOKIES}" > cookies.txt
+            COOKIES_OPT="--cookies cookies.txt"
+          else
+            COOKIES_OPT=""
+          fi
+          # Try Android player client first (often bypasses bot checks), then fallback once
+          yt-dlp $COOKIES_OPT --extractor-args "youtube:player_client=android" \
+            -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+            "https://www.youtube.com/watch?v=${VIDEO_ID}" || \
+          yt-dlp $COOKIES_OPT \
+            -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" \
+            "https://www.youtube.com/watch?v=${VIDEO_ID}"
           ls -lah
 
       - name: Transcribe + select highlight + burn subs
@@ -90,8 +113,33 @@ jobs:
           START=$(python -c 'import json;print(json.load(open("artifact.json"))["start"])')
           END=$(python -c 'import json;print(json.load(open("artifact.json"))["end"])')
           OUTFILE=$(python -c 'import json;print(json.load(open("artifact.json"))["outfile"])')
-          # keep filename simple to avoid quoting issues for now
           DEST="${GDRIVE_REMOTE}:${GDRIVE_PATH%/}/${VIDEO_ID}_${START}-${END}.mp4"
           echo "Uploading $OUTFILE → $DEST"
           rclone copy "$OUTFILE" "$DEST" --progress
           echo "rclone upload OK ✅"
+
+      - name: (Optional) Callback to Make.com
+        if: always()
+        run: |
+          python - <<'PY'
+import json,requests,os
+payload = {
+  "videoId": "${{ steps.meta.outputs.videoId }}",
+  "title": "${{ steps.meta.outputs.title }}",
+  "channel": "${{ steps.meta.outputs.channel }}",
+  "channelId": "${{ steps.meta.outputs.channelId }}",
+  "publishedAt": "${{ steps.meta.outputs.publishedAt }}",
+  "status": "success" if os.path.exists("artifact.json") else "failed"
+}
+if os.path.exists("artifact.json"):
+  payload.update(json.load(open('artifact.json')))
+url = os.getenv('MAKE_WEBHOOK')
+if url:
+  try:
+    r = requests.post(url, json=payload, timeout=20)
+    print("Callback status:", r.status_code)
+  except Exception as e:
+    print("Callback error:", e)
+else:
+  print("MAKE_WEBHOOK not set; skipping callback.")
+PY
