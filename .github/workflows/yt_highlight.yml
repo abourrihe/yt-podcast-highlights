@@ -1,4 +1,4 @@
-name: YouTube Highlight Drive (rclone test)
+name: YouTube Highlight Drive (rclone verified)
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
 jobs:
   setup-install-and-rclone:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -29,20 +30,36 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
 
-      # --- rclone config restore + test ---
-      - name: Restore rclone config from secret
+      # ===== RCLONE: restore config from BASE64 secret (robust) =====
+      - name: Restore rclone config from base64 secret
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
         run: |
+          if [ -z "${RCLONE_CONFIG_B64}" ]; then
+            echo "Missing secret RCLONE_CONFIG_B64. Please create it with your base64-encoded rclone.conf."; exit 1
+          fi
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG_CONTENTS }}" > ~/.config/rclone/rclone.conf
-          # basic sanity check: show remotes
-          rclone listremotes
+          echo "$RCLONE_CONFIG_B64" | base64 -d > ~/.config/rclone/rclone.conf
+          # quick sanity
+          echo "Remotes found:" && rclone listremotes || true
 
-      - name: Test Drive access (list destination folder)
+      - name: Show parsed config (safe/masked by rclone)
+        run: |
+          echo "---- BEGIN rclone.conf (masked) ----"
+          rclone config show || true
+          echo "---- END ----"
+          echo "Line count:" $(wc -l < ~/.config/rclone/rclone.conf)
+          file ~/.config/rclone/rclone.conf || true
+
+      - name: Test Drive access (list or create destination)
         env:
           GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
           GDRIVE_PATH: ${{ secrets.GDRIVE_PATH }}
         run: |
-          echo "Listing: ${GDRIVE_REMOTE}:${GDRIVE_PATH}"
-          rclone lsd "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}" || rclone mkdir "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}"
-          rclone lsd "${GDRIVE_REMOTE}:${GDRIVE_PATH%/}"
-          echo "rclone OK"
+          if [ -z "${GDRIVE_REMOTE}" ] || [ -z "${GDRIVE_PATH}" ]; then
+            echo "Missing GDRIVE_REMOTE or GDRIVE_PATH secrets."; exit 1
+          fi
+          DEST="${GDRIVE_REMOTE}:${GDRIVE_PATH%/}"
+          echo "Listing: $DEST"
+          rclone lsd "$DEST" || (echo "Creating $DEST" && rclone mkdir "$DEST" && rclone lsd "$DEST")
+          echo "rclone OK ✅"
