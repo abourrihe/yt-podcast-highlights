@@ -1,0 +1,12 @@
+{
+  "skip_shorts": true,
+  "skip_livestreams": true,
+  "min_source_length_minutes": 5,
+  "channels": [
+    { "name": "Finjan (Thmanyah)", "channel_id": "", "handle": "@FinjanPodcast" },
+    { "name": "Swalif Business (Thmanyah)", "channel_id": "", "handle": "@SwalifBusiness" },
+    { "name": "Saudis Podcast", "channel_id": "", "handle": "@SaudisPodcast" },
+    { "name": "Al Ghabouq Podcast", "channel_id": "", "handle": "@AlGhabouk" },
+    { "name": "Mi'yar Podcast", "channel_id": "", "handle": "@soltah4" }
+  ]
+}
