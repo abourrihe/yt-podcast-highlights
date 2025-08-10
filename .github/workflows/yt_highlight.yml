@@ -1,0 +1,128 @@
+name: YouTube → Highlight → Drive
+
+on:
+  repository_dispatch:
+    types: [yt-new-video]
+  workflow_dispatch:
+    inputs:
+      videoId:
+        description: "YouTube video ID"
+        required: true
+      title:
+        description: "Title"
+        required: true
+      channel:
+        description: "Channel name"
+        required: true
+      channelId:
+        description: "Channel ID (UC...)"
+        required: true
+      publishedAt:
+        description: "ISO time"
+        required: true
+
+env:
+  GDRIVE_REMOTE: ${{ secrets.GDRIVE_REMOTE }}
+  GDRIVE_PATH:   ${{ secrets.GDRIVE_PATH }}
+  MAKE_WEBHOOK:  ${{ secrets.MAKE_WEBHOOK }}
+  FONT_URL: https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf
+
+jobs:
+  highlight:
+    name: Build highlight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: highlight-${{ github.event.client_payload.videoId || inputs.videoId }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk
+          curl -L "$FONT_URL" -o ./NotoNaskhArabic-Regular.ttf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore rclone config
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_CONTENTS }}" > ~/.config/rclone/rclone.conf
+
+      - name: Resolve inputs
+        id: meta
+        run: |
+          echo "videoId=${{ github.event.client_payload.videoId || inputs.videoId }}" >> $GITHUB_OUTPUT
+          echo "title=${{ github.event.client_payload.title || inputs.title }}" >> $GITHUB_OUTPUT
+          echo "channel=${{ github.event.client_payload.channel || inputs.channel }}" >> $GITHUB_OUTPUT
+          echo "channelId=${{ github.event.client_payload.channelId || inputs.channelId }}" >> $GITHUB_OUTPUT
+          echo "publishedAt=${{ github.event.client_payload.publishedAt || inputs.publishedAt }}" >> $GITHUB_OUTPUT
+
+      - name: Download source video (yt-dlp)
+        run: |
+          set -e
+          VIDEO_ID=${{ steps.meta.outputs.videoId }}
+          yt-dlp -o "input.%(ext)s" -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" "https://www.youtube.com/watch?v=${VIDEO_ID}"
+          ls -lah
+
+      - name: Transcribe + select highlight
+        run: |
+          python scripts/process_video.py \
+            --input input.mp4 \
+            --min-seconds 30 \
+            --max-seconds 60 \
+            --lang ar \
+            --keywords-prefer "قصة,مهم,نصيحة,أفضل,ضحك,سر,خطأ,نجاح,تجربة,لقطة" \
+            --keywords-avoid "إعلان,موسيقى,مقدمة,خاتمة" \
+            --font ./NotoNaskhArabic-Regular.ttf
+
+      - name: Upload to Google Drive (rclone)
+        if: success()
+        run: |
+          set -e
+          VIDEO_ID=${{ steps.meta.outputs.videoId }}
+          CHANNEL=$(python -c 'import json;import sys;d=json.load(open("artifact.json"));print(d["channel"])')
+          START=$(python -c 'import json;print(__import__("json").load(open("artifact.json"))["start"])')
+          END=$(python -c 'import json;print(__import__("json").load(open("artifact.json"))["end"])')
+          OUTFILE=$(python -c 'import json;print(__import__("json").load(open("artifact.json"))["outfile"])')
+          SAFE_CH=$(python - <<PY
+from slugify import slugify
+print(slugify("${{ steps.meta.outputs.channel }}", lowercase=False, regex_pattern=r"[^-\w\s]"))
+PY
+)
+          DEST_PATH="${GDRIVE_REMOTE}:${GDRIVE_PATH}/${SAFE_CH}_${VIDEO_ID}_${START}-${END}.mp4"
+          rclone copy "$OUTFILE" "$DEST_PATH" --progress
+          echo "dest=${DEST_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Report back to Make.com
+        if: always()
+        run: |
+          python - <<PY
+import json,requests,os
+payload = {
+  "videoId": "${{ steps.meta.outputs.videoId }}",
+  "title": "${{ steps.meta.outputs.title }}",
+  "channel": "${{ steps.meta.outputs.channel }}",
+  "channelId": "${{ steps.meta.outputs.channelId }}",
+  "status": "success" if "artifact.json" in os.listdir('.') else "failed",
+}
+if os.path.exists('artifact.json'):
+  payload.update(json.load(open('artifact.json')))
+try:
+  if os.getenv('MAKE_WEBHOOK'):
+    r = requests.post(os.getenv('MAKE_WEBHOOK'), json=payload, timeout=20)
+    print('POST', r.status_code)
+except Exception as e:
+  print('callback error', e)
+PY
