@@ -1,15 +1,36 @@
-name: YouTube Highlight Drive (inputs test)
+name: YouTube Highlight Drive (install test)
 
 on:
   workflow_dispatch:
     inputs:
       videoId:
-        description: "YouTube video ID"
+        description: "YouTube video ID (just to keep the input UI)"
         required: true
 
 jobs:
-  echo-input:
+  setup-and-install:
     runs-on: ubuntu-latest
     steps:
-      - name: Print videoId
-        run: echo "videoId=${{ inputs.videoId }}"
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install system deps (ffmpeg + fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify installs
+        run: |
+          ffmpeg -version | head -n 1
+          python --version
+          python -c "import faster_whisper, pysrt; print('Python deps OK')"
