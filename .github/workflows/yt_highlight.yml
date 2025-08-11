@@ -18,13 +18,26 @@ on:
         required: false
         default: "Default"
         type: string
+      format:
+        description: "yt-dlp format (advanced; leave default unless needed)"
+        required: false
+        default: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
+        type: string
 
 jobs:
   highlight:
     runs-on: self-hosted
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # --- Windows-only: allow setup scripts to run (solves ExecutionPolicy error) ---
+      - name: Allow PowerShell scripts for this user (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,43 +45,79 @@ jobs:
           python-version: '3.11'
 
       - name: Install yt-dlp
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
 
-      - name: Install ffmpeg (Windows)
+      # --- macOS ffmpeg (skip if installed) ---
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already installed"
+          else
+            if command -v brew >/dev/null 2>&1; then
+              brew install ffmpeg
+            else
+              echo "Homebrew not found. Install from https://brew.sh then rerun." && exit 1
+            fi
+          fi
+
+      # --- Windows: download portable ffmpeg; no admin/winget/choco needed ---
+      - name: Install ffmpeg (Windows, portable)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-            "ffmpeg already installed"
-          }
-          elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-            winget install -e --id Gyan.FFmpeg
-          }
-          else {
-            Write-Error "Please install ffmpeg manually or add winget/choco"
+          $ErrorActionPreference = "Stop"
+          $temp = Join-Path $env:RUNNER_TEMP "ffmpeg"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+          $zip = Join-Path $temp "ffmpeg.zip"
+
+          try {
+            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
+          } catch {
+            & curl.exe -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o $zip
           }
 
-      - name: Download source video (from local browser cookies)
+          Expand-Archive -Path $zip -DestinationPath $temp -Force
+
+          $bin = Get-ChildItem -Path $temp -Recurse -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName "bin\ffmpeg.exe") } |
+            Select-Object -First 1
+          if (-not $bin) { throw "ffmpeg bin folder not found after extract." }
+
+          $binPath = Join-Path $bin.FullName "bin"
+          $binPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          & (Join-Path $binPath "ffmpeg.exe") -version
+
+      - name: Download source video (live cookies from local browser)
         shell: bash
         run: |
           set -euo pipefail
           VIDEO_ID='${{ inputs.videoId }}'
           BROWSER='${{ inputs.browser }}'
           PROFILE='${{ inputs.profile }}'
+          FMT='${{ inputs.format }}'
 
           echo "Using browser=$BROWSER, profile=$PROFILE"
-          yt-dlp --cookies-from-browser "${BROWSER}:profile=${PROFILE}" \
+          CFB="${BROWSER}:profile=${PROFILE}"
+
+          yt-dlp --cookies-from-browser "$CFB" \
                  --extractor-args "youtube:player_client=android" \
-                 -o "input.%(ext)s" \
+                 -o "input.%(ext)s" -f "$FMT" \
                  "https://www.youtube.com/watch?v=${VIDEO_ID}"
 
           ls -lah
 
-      - name: Upload video artifact
+      - name: Upload source artifact
         uses: actions/upload-artifact@v4
         with:
           name: source-video
-          path: input*
+          path: |
+            input*.mp4
+            input*.mkv
+            input*.webm
           if-no-files-found: warn
