@@ -1,4 +1,4 @@
-name: YouTube Highlight (self-hosted, Windows)
+name: YouTube Highlight (self-hosted, Windows - no browser kill)
 
 on:
   workflow_dispatch:
@@ -8,18 +8,18 @@ on:
         required: true
         type: string
       browser:
-        description: "Browser to read cookies from (chrome or edge)"
+        description: "Browser to read cookies from (edge or chrome). Prefer one you can close."
         required: true
-        default: "chrome"
+        default: "edge"
         type: choice
-        options: [chrome, edge]
+        options: [edge, chrome]
       profile:
-        description: 'Browser profile folder (e.g., "Default" or "Profile 1"). Leave as Default if unsure.'
+        description: 'Browser profile folder (e.g., "Default", "Profile 1"). If unsure, leave as Default.'
         required: false
         default: "Default"
         type: string
       format:
-        description: "yt-dlp format (leave default unless needed)"
+        description: "yt-dlp format"
         required: false
         default: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
         type: string
@@ -57,7 +57,7 @@ jobs:
             Write-Host "WARNING: ffmpeg not found on PATH. If a merge is required, install ffmpeg or add it to PATH."
           }
 
-      - name: Download source video (live cookies from local browser)
+      - name: Download source video (live cookies; no browser kill)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -70,64 +70,47 @@ jobs:
           Write-Host "Requested browser=$BROWSER, profile=$PROFILE"
 
           function Resolve-Profile {
-            param(
-              [Parameter(Mandatory=$true)][string]$Browser,
-              [Parameter(Mandatory=$true)][string]$Profile
-            )
+            param([string]$Browser, [string]$Profile)
 
             $bases = @()
             if ($Browser -eq 'chrome') {
               $bases += (Join-Path $env:LOCALAPPDATA  'Google\Chrome\User Data')
-              $bases += (Join-Path $env:APPDATA       'Google\Chrome\User Data')   # fallback (rare)
+              $bases += (Join-Path $env:APPDATA       'Google\Chrome\User Data')
             } elseif ($Browser -eq 'edge') {
               $bases += (Join-Path $env:LOCALAPPDATA  'Microsoft\Edge\User Data')
-              $bases += (Join-Path $env:APPDATA       'Microsoft\Edge\User Data')  # fallback (rare)
-            } else {
-              throw "Unsupported browser: $Browser"
-            }
+              $bases += (Join-Path $env:APPDATA       'Microsoft\Edge\User Data')
+            } else { throw "Unsupported browser: $Browser" }
 
             foreach ($base in $bases) {
               if (-not (Test-Path $base)) { continue }
 
               $profPath = Join-Path $base $Profile
-              if (Test-Path $profPath) {
-                return @{ Path = $profPath; Name = $Profile; Base = $base }
-              }
+              if (Test-Path $profPath) { return @{ Path=$profPath; Name=$Profile; Base=$base } }
 
-              # Auto-detect a usable profile if requested one isn't there
               $candidates = Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -match '^(Default|Profile \d+)$' }
 
-              # Prefer ones that actually have a Cookies DB (Chrome: Network\Cookies; Edge similar)
               $scored = foreach ($d in $candidates) {
                 $cookie1 = Join-Path $d.FullName 'Network\Cookies'
                 $cookie2 = Join-Path $d.FullName 'Cookies'
-                [pscustomobject]@{
-                  Name = $d.Name
-                  Full = $d.FullName
-                  HasCookies = (Test-Path $cookie1) -or (Test-Path $cookie2)
-                }
+                [pscustomobject]@{ Name=$d.Name; Full=$d.FullName; HasCookies=(Test-Path $cookie1) -or (Test-Path $cookie2) }
               }
 
               $pick = $scored | Sort-Object -Property @{Expression='HasCookies';Descending=$true}, Name | Select-Object -First 1
-              if ($pick) {
-                return @{ Path = $pick.Full; Name = $pick.Name; Base = $base }
-              }
+              if ($pick) { return @{ Path=$pick.Full; Name=$pick.Name; Base=$base } }
             }
 
             return $null
           }
 
+          # 1) Resolve profile path
           $resolved = Resolve-Profile -Browser $BROWSER -Profile $PROFILE
           if ($null -eq $resolved) {
-            Write-Host "Could not locate a profile under expected bases."
-            Write-Host "Checked:"
+            Write-Host "Could not locate a profile."
             if ($BROWSER -eq 'chrome') {
-              Write-Host (" - " + (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'))
-              Write-Host (" - " + (Join-Path $env:APPDATA      'Google\Chrome\User Data'))
+              Write-Host ("Checked: " + (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data') + " and " + (Join-Path $env:APPDATA 'Google\Chrome\User Data'))
             } else {
-              Write-Host (" - " + (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'))
-              Write-Host (" - " + (Join-Path $env:APPDATA      'Microsoft\Edge\User Data'))
+              Write-Host ("Checked: " + (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data') + " and " + (Join-Path $env:APPDATA 'Microsoft\Edge\User Data'))
             }
             Write-Host "Open chrome://version or edge://version and copy the tail of 'Profile Path' (e.g. 'Default' or 'Profile 1')."
             throw "Browser profile '$PROFILE' not found for $BROWSER"
@@ -135,7 +118,17 @@ jobs:
 
           Write-Host ("Resolved profile: " + $resolved.Name + " at " + $resolved.Path)
 
-          # Build cookies-from-browser argument safely
+          # 2) Ensure target browser isn't running (we won't kill it; just fail with a clear message)
+          $procName = if ($BROWSER -eq 'chrome') { 'chrome' } else { 'msedge' }
+          $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+          if ($procs) {
+            Write-Host "The selected browser ($procName) is currently running."
+            Write-Host "To avoid the locked cookie database error, please close ALL windows of $procName for the duration of the run."
+            Write-Host "Tip: Use a secondary browser for Actions (e.g., Edge) while you keep your main browser open."
+            throw "Cookie DB is locked because $procName is running."
+          }
+
+          # 3) Build cookies-from-browser arg and download
           $CFB = $BROWSER + ':' + $resolved.Name
           Write-Host "cookies-from-browser = $CFB"
 
