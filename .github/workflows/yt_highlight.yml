@@ -14,7 +14,7 @@ on:
         type: choice
         options: [chrome, edge]
       profile:
-        description: 'Browser profile folder name (e.g., "Default" or "Profile 1")'
+        description: 'Browser profile folder (e.g., "Default" or "Profile 1"). Leave as Default if unsure.'
         required: false
         default: "Default"
         type: string
@@ -67,27 +67,76 @@ jobs:
           $PROFILE  = '${{ inputs.profile }}'
           $FMT      = '${{ inputs.format }}'
 
-          Write-Host "Using browser=$BROWSER, profile=$PROFILE"
+          Write-Host "Requested browser=$BROWSER, profile=$PROFILE"
 
-          # Resolve expected profile path and validate it exists
-          if ($BROWSER -eq 'chrome') {
-            $base = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
-          } elseif ($BROWSER -eq 'edge') {
-            $base = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
-          } else {
-            throw "Unsupported browser: $BROWSER"
+          function Resolve-Profile {
+            param(
+              [Parameter(Mandatory=$true)][string]$Browser,
+              [Parameter(Mandatory=$true)][string]$Profile
+            )
+
+            $bases = @()
+            if ($Browser -eq 'chrome') {
+              $bases += (Join-Path $env:LOCALAPPDATA  'Google\Chrome\User Data')
+              $bases += (Join-Path $env:APPDATA       'Google\Chrome\User Data')   # fallback (rare)
+            } elseif ($Browser -eq 'edge') {
+              $bases += (Join-Path $env:LOCALAPPDATA  'Microsoft\Edge\User Data')
+              $bases += (Join-Path $env:APPDATA       'Microsoft\Edge\User Data')  # fallback (rare)
+            } else {
+              throw "Unsupported browser: $Browser"
+            }
+
+            foreach ($base in $bases) {
+              if (-not (Test-Path $base)) { continue }
+
+              $profPath = Join-Path $base $Profile
+              if (Test-Path $profPath) {
+                return @{ Path = $profPath; Name = $Profile; Base = $base }
+              }
+
+              # Auto-detect a usable profile if requested one isn't there
+              $candidates = Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^(Default|Profile \d+)$' }
+
+              # Prefer ones that actually have a Cookies DB (Chrome: Network\Cookies; Edge similar)
+              $scored = foreach ($d in $candidates) {
+                $cookie1 = Join-Path $d.FullName 'Network\Cookies'
+                $cookie2 = Join-Path $d.FullName 'Cookies'
+                [pscustomobject]@{
+                  Name = $d.Name
+                  Full = $d.FullName
+                  HasCookies = (Test-Path $cookie1) -or (Test-Path $cookie2)
+                }
+              }
+
+              $pick = $scored | Sort-Object -Property @{Expression='HasCookies';Descending=$true}, Name | Select-Object -First 1
+              if ($pick) {
+                return @{ Path = $pick.Full; Name = $pick.Name; Base = $base }
+              }
+            }
+
+            return $null
           }
 
-          $profPath = Join-Path $base $PROFILE
-          Write-Host "Expecting profile folder at: $profPath"
-          if (-not (Test-Path $profPath)) {
-            Write-Host "Profile folder not found at: $profPath"
+          $resolved = Resolve-Profile -Browser $BROWSER -Profile $PROFILE
+          if ($null -eq $resolved) {
+            Write-Host "Could not locate a profile under expected bases."
+            Write-Host "Checked:"
+            if ($BROWSER -eq 'chrome') {
+              Write-Host (" - " + (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'))
+              Write-Host (" - " + (Join-Path $env:APPDATA      'Google\Chrome\User Data'))
+            } else {
+              Write-Host (" - " + (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'))
+              Write-Host (" - " + (Join-Path $env:APPDATA      'Microsoft\Edge\User Data'))
+            }
             Write-Host "Open chrome://version or edge://version and copy the tail of 'Profile Path' (e.g. 'Default' or 'Profile 1')."
-            throw "Browser profile '$PROFILE' not found."
+            throw "Browser profile '$PROFILE' not found for $BROWSER"
           }
 
-          # Build cookies-from-browser argument safely (avoid interpolation issues with :)
-          $CFB = $BROWSER + ':' + $PROFILE
+          Write-Host ("Resolved profile: " + $resolved.Name + " at " + $resolved.Path)
+
+          # Build cookies-from-browser argument safely
+          $CFB = $BROWSER + ':' + $resolved.Name
           Write-Host "cookies-from-browser = $CFB"
 
           yt-dlp --cookies-from-browser "$CFB" `
