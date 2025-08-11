@@ -1,4 +1,4 @@
-name: YouTube Highlight (Windows, self-hosted, Firefox)
+name: YouTube Highlight (Windows + Firefox, WEB client)
 
 on:
   workflow_dispatch:
@@ -8,14 +8,14 @@ on:
         required: true
         type: string
       profile:
-        description: 'Firefox profile name from about:profiles (e.g., "xxxxx.default-release")'
+        description: 'Firefox profile folder from about:profiles (e.g., "yov4tydr.default-release-3")'
         required: true
-        default: "default-release"
+        default: "yov4tydr.default-release-3"
         type: string
       format:
-        description: "yt-dlp format"
+        description: "yt-dlp format selector"
         required: false
-        default: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
+        default: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
         type: string
 
 jobs:
@@ -41,54 +41,54 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
 
-      - name: Check ffmpeg (optional)
+      - name: Ensure Firefox is closed
         shell: powershell
         run: |
-          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-            ffmpeg -version | Select-Object -First 1
-          } else {
-            Write-Host "WARNING: ffmpeg not found on PATH. If a merge is required, install ffmpeg or add it to PATH."
-          }
-
-      - name: Download with Firefox cookies (no DPAPI)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $VIDEO_ID = '${{ inputs.videoId }}'
-          $PROFILE  = '${{ inputs.profile }}'
-          $FMT      = '${{ inputs.format }}'
-
-          # Ensure Firefox is closed (no background)
-          $procs = Get-Process -Name firefox -ErrorAction SilentlyContinue
-          if ($procs) {
+          if (Get-Process firefox -ErrorAction SilentlyContinue) {
             Write-Error "Firefox is running. Please close all Firefox windows before starting the run."
             exit 1
           }
 
-          # Validate profile folder exists under %APPDATA%\Mozilla\Firefox\Profiles
+      - name: Validate Firefox profile
+        shell: powershell
+        run: |
           $base = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
-          if (-not (Test-Path (Join-Path $base $PROFILE))) {
-            Write-Host "Profile '$PROFILE' not found under $base"
-            Write-Host "Open about:profiles and copy the *folder name* (e.g., 'xxxxx.default-release')."
+          $prof = '${{ inputs.profile }}'
+          $path = Join-Path $base $prof
+          Write-Host "Checking profile at: $path"
+          if (-not (Test-Path $path)) {
+            Write-Error "Firefox profile '$prof' not found under $base. Open about:profiles and copy the folder name."
             exit 1
           }
 
-          $CFB = "firefox:$PROFILE"
+      - name: List formats (WEB client) and save output
+        shell: powershell
+        run: |
+          $CFB = "firefox:${{ inputs.profile }}"
+          $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           Write-Host "Using cookies-from-browser = $CFB"
+          Write-Host "FORCING WEB CLIENT"
+          yt-dlp --verbose --cookies-from-browser $CFB `
+                 --extractor-args "youtube:player_client=web" `
+                 -F $URL | Tee-Object -FilePath list-formats.txt
 
-          yt-dlp --cookies-from-browser $CFB `
-                 --extractor-args "youtube:player_client=android" `
+      - name: Download (WEB client)
+        shell: powershell
+        run: |
+          $CFB = "firefox:${{ inputs.profile }}"
+          $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
+          $FMT = '${{ inputs.format }}'
+          yt-dlp --verbose --cookies-from-browser $CFB `
+                 --extractor-args "youtube:player_client=web" `
                  -o "input.%(ext)s" -f $FMT `
-                 "https://www.youtube.com/watch?v=$VIDEO_ID"
+                 $URL
 
-          Write-Host "Files:"
-          Get-ChildItem -Force | Format-Table -AutoSize
-
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: source-video
+          name: yt-debug-and-source
           path: |
+            list-formats.txt
             input*.mp4
             input*.mkv
             input*.webm
