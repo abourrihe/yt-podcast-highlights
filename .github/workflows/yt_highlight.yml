@@ -32,7 +32,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # --- Windows-only: allow setup scripts to run (solves ExecutionPolicy error) ---
+      # Windows: allow setup scripts to run (solves ExecutionPolicy error)
       - name: Allow PowerShell scripts for this user (Windows)
         if: runner.os == 'Windows'
         shell: powershell
@@ -44,13 +44,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install yt-dlp
-        shell: bash
+      # Install yt-dlp (Windows via PowerShell; macOS via bash)
+      - name: Install yt-dlp (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
 
-      # --- macOS ffmpeg (skip if installed) ---
+      - name: Install yt-dlp (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install --upgrade yt-dlp
+
+      # macOS ffmpeg (skip if installed)
       - name: Install ffmpeg (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -65,7 +74,7 @@ jobs:
             fi
           fi
 
-      # --- Windows: download portable ffmpeg; no admin/winget/choco needed ---
+      # Windows: download portable ffmpeg; no admin/winget/choco needed
       - name: Install ffmpeg (Windows, portable)
         if: runner.os == 'Windows'
         shell: powershell
@@ -93,7 +102,30 @@ jobs:
 
           & (Join-Path $binPath "ffmpeg.exe") -version
 
-      - name: Download source video (live cookies from local browser)
+      # Download using live cookies from local browser (Windows via PowerShell)
+      - name: Download source video (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $VIDEO_ID='${{ inputs.videoId }}'
+          $BROWSER='${{ inputs.browser }}'
+          $PROFILE='${{ inputs.profile }}'
+          $FMT='${{ inputs.format }}'
+
+          Write-Host "Using browser=$BROWSER, profile=$PROFILE"
+          $CFB="$BROWSER:profile=$PROFILE"
+
+          yt-dlp --cookies-from-browser "$CFB" `
+                 --extractor-args "youtube:player_client=android" `
+                 -o "input.%(ext)s" -f "$FMT" `
+                 "https://www.youtube.com/watch?v=$VIDEO_ID"
+
+          Get-ChildItem -Force
+
+      # Download using live cookies from local browser (macOS via bash)
+      - name: Download source video (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
@@ -101,7 +133,6 @@ jobs:
           BROWSER='${{ inputs.browser }}'
           PROFILE='${{ inputs.profile }}'
           FMT='${{ inputs.format }}'
-
           echo "Using browser=$BROWSER, profile=$PROFILE"
           CFB="${BROWSER}:profile=${PROFILE}"
 
