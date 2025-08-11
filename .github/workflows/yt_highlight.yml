@@ -79,14 +79,16 @@ jobs:
           }
 
           $profPath = Join-Path $base $PROFILE
+          Write-Host "Expecting profile folder at: $profPath"
           if (-not (Test-Path $profPath)) {
             Write-Host "Profile folder not found at: $profPath"
             Write-Host "Open chrome://version or edge://version and copy the tail of 'Profile Path' (e.g. 'Default' or 'Profile 1')."
             throw "Browser profile '$PROFILE' not found."
           }
 
-          # Correct yt-dlp syntax: "<browser>:<profile>"  (NOT profile=Default)
-          $CFB = "$BROWSER:$PROFILE"
+          # Build cookies-from-browser argument safely (avoid interpolation issues with :)
+          $CFB = $BROWSER + ':' + $PROFILE
+          Write-Host "cookies-from-browser = $CFB"
 
           yt-dlp --cookies-from-browser "$CFB" `
                  --extractor-args "youtube:player_client=android" `
