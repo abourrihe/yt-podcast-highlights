@@ -8,13 +8,13 @@ on:
         required: true
         type: string
       browser:
-        description: "Browser to read cookies from"
+        description: "Browser to read cookies from (chrome or edge)"
         required: true
         default: "chrome"
         type: choice
         options: [chrome, edge]
       profile:
-        description: 'Browser profile name (e.g., "Default", "Profile 1")'
+        description: 'Browser profile folder name (e.g., "Default" or "Profile 1")'
         required: false
         default: "Default"
         type: string
@@ -32,8 +32,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Allow PowerShell scripts for this user (so setup-python can run its scripts)
-      - name: Allow PowerShell scripts
+      - name: Allow PowerShell scripts (CurrentUser)
         shell: powershell
         run: |
           Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
@@ -49,27 +48,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
 
-      # (Optional) sanity check ffmpeg; warns but does not fail
       - name: Check ffmpeg availability
         shell: powershell
         run: |
           if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
             ffmpeg -version | Select-Object -First 1
           } else {
-            Write-Host "WARNING: ffmpeg not found on PATH. If merge is needed, install ffmpeg or add it to PATH."
+            Write-Host "WARNING: ffmpeg not found on PATH. If a merge is required, install ffmpeg or add it to PATH."
           }
 
-      - name: Download source video (live cookies)
+      - name: Download source video (live cookies from local browser)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $VIDEO_ID='${{ inputs.videoId }}'
-          $BROWSER='${{ inputs.browser }}'
-          $PROFILE='${{ inputs.profile }}'
-          $FMT='${{ inputs.format }}'
+
+          $VIDEO_ID = '${{ inputs.videoId }}'
+          $BROWSER  = '${{ inputs.browser }}'.ToLower()
+          $PROFILE  = '${{ inputs.profile }}'
+          $FMT      = '${{ inputs.format }}'
 
           Write-Host "Using browser=$BROWSER, profile=$PROFILE"
-          $CFB="$($BROWSER.ToLower()):profile=$PROFILE"
+
+          # Resolve expected profile path and validate it exists
+          if ($BROWSER -eq 'chrome') {
+            $base = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+          } elseif ($BROWSER -eq 'edge') {
+            $base = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
+          } else {
+            throw "Unsupported browser: $BROWSER"
+          }
+
+          $profPath = Join-Path $base $PROFILE
+          if (-not (Test-Path $profPath)) {
+            Write-Host "Profile folder not found at: $profPath"
+            Write-Host "Open chrome://version or edge://version and copy the tail of 'Profile Path' (e.g. 'Default' or 'Profile 1')."
+            throw "Browser profile '$PROFILE' not found."
+          }
+
+          # Correct yt-dlp syntax: "<browser>:<profile>"  (NOT profile=Default)
+          $CFB = "$BROWSER:$PROFILE"
 
           yt-dlp --cookies-from-browser "$CFB" `
                  --extractor-args "youtube:player_client=android" `
