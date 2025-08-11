@@ -1,4 +1,4 @@
-name: YouTube Highlight (self-hosted)
+name: YouTube Highlight (self-hosted, Windows)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
         default: "Default"
         type: string
       format:
-        description: "yt-dlp format (advanced; leave default unless needed)"
+        description: "yt-dlp format (leave default unless needed)"
         required: false
         default: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
         type: string
@@ -32,9 +32,8 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Windows: allow setup scripts to run (solves ExecutionPolicy error)
-      - name: Allow PowerShell scripts for this user (Windows)
-        if: runner.os == 'Windows'
+      # Allow PowerShell scripts for this user (so setup-python can run its scripts)
+      - name: Allow PowerShell scripts
         shell: powershell
         run: |
           Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
@@ -44,67 +43,23 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Install yt-dlp (Windows via PowerShell; macOS via bash)
-      - name: Install yt-dlp (Windows)
-        if: runner.os == 'Windows'
+      - name: Install yt-dlp
         shell: powershell
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
 
-      - name: Install yt-dlp (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          python3 -m pip install --upgrade pip
-          pip3 install --upgrade yt-dlp
-
-      # macOS ffmpeg (skip if installed)
-      - name: Install ffmpeg (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          if command -v ffmpeg >/dev/null 2>&1; then
-            echo "ffmpeg already installed"
-          else
-            if command -v brew >/dev/null 2>&1; then
-              brew install ffmpeg
-            else
-              echo "Homebrew not found. Install from https://brew.sh then rerun." && exit 1
-            fi
-          fi
-
-      # Windows: download portable ffmpeg; no admin/winget/choco needed
-      - name: Install ffmpeg (Windows, portable)
-        if: runner.os == 'Windows'
+      # (Optional) sanity check ffmpeg; warns but does not fail
+      - name: Check ffmpeg availability
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $temp = Join-Path $env:RUNNER_TEMP "ffmpeg"
-          New-Item -ItemType Directory -Force -Path $temp | Out-Null
-          $zip = Join-Path $temp "ffmpeg.zip"
-
-          try {
-            Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
-          } catch {
-            & curl.exe -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o $zip
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            ffmpeg -version | Select-Object -First 1
+          } else {
+            Write-Host "WARNING: ffmpeg not found on PATH. If merge is needed, install ffmpeg or add it to PATH."
           }
 
-          Expand-Archive -Path $zip -DestinationPath $temp -Force
-
-          $bin = Get-ChildItem -Path $temp -Recurse -Directory |
-            Where-Object { Test-Path (Join-Path $_.FullName "bin\ffmpeg.exe") } |
-            Select-Object -First 1
-          if (-not $bin) { throw "ffmpeg bin folder not found after extract." }
-
-          $binPath = Join-Path $bin.FullName "bin"
-          $binPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-          & (Join-Path $binPath "ffmpeg.exe") -version
-
-      # Download using live cookies from local browser (Windows via PowerShell)
-      - name: Download source video (Windows)
-        if: runner.os == 'Windows'
+      - name: Download source video (live cookies)
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -114,34 +69,15 @@ jobs:
           $FMT='${{ inputs.format }}'
 
           Write-Host "Using browser=$BROWSER, profile=$PROFILE"
-          $CFB="$BROWSER:profile=$PROFILE"
+          $CFB="$($BROWSER.ToLower()):profile=$PROFILE"
 
           yt-dlp --cookies-from-browser "$CFB" `
                  --extractor-args "youtube:player_client=android" `
                  -o "input.%(ext)s" -f "$FMT" `
                  "https://www.youtube.com/watch?v=$VIDEO_ID"
 
-          Get-ChildItem -Force
-
-      # Download using live cookies from local browser (macOS via bash)
-      - name: Download source video (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          VIDEO_ID='${{ inputs.videoId }}'
-          BROWSER='${{ inputs.browser }}'
-          PROFILE='${{ inputs.profile }}'
-          FMT='${{ inputs.format }}'
-          echo "Using browser=$BROWSER, profile=$PROFILE"
-          CFB="${BROWSER}:profile=${PROFILE}"
-
-          yt-dlp --cookies-from-browser "$CFB" \
-                 --extractor-args "youtube:player_client=android" \
-                 -o "input.%(ext)s" -f "$FMT" \
-                 "https://www.youtube.com/watch?v=${VIDEO_ID}"
-
-          ls -lah
+          Write-Host "Downloaded files:"
+          Get-ChildItem -Force | Format-Table -AutoSize
 
       - name: Upload source artifact
         uses: actions/upload-artifact@v4
