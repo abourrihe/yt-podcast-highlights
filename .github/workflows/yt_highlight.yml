@@ -59,14 +59,60 @@ jobs:
           pip install yt-dlp==2025.01.26
           pip install faster-whisper==1.0.3 pandas==2.2.2
 
-      - name: Check ffmpeg availability
+      # Detect existing ffmpeg; add to PATH if found; otherwise download portable
+      - name: Ensure ffmpeg available (prefer existing install)
         shell: powershell
         run: |
-          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-            ffmpeg -version | Select-Object -First 1
-          } else {
-            Write-Error "ffmpeg not found on PATH. Install ffmpeg and rerun." ; exit 1
+          $ErrorActionPreference = "Stop"
+
+          function Add-ToPath([string]$p) {
+            if (Test-Path $p) {
+              $p | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "Added to PATH for this job: $p"
+              return $true
+            }
+            return $false
           }
+
+          $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          if ($cmd) {
+            Write-Host "ffmpeg already on PATH at: $($cmd.Source)"
+          } else {
+            Write-Host "ffmpeg not found on PATH. Searching common locations..."
+            $candidates = @(
+              "C:\ffmpeg\bin",
+              "C:\Program Files\ffmpeg\bin",
+              "C:\Program Files (x86)\ffmpeg\bin",
+              "$env:ProgramData\chocolatey\bin",
+              "$env:USERPROFILE\scoop\apps\ffmpeg\current\bin"
+            )
+            $found = $false
+            foreach ($d in $candidates) {
+              if (Test-Path (Join-Path $d "ffmpeg.exe")) {
+                $found = Add-ToPath $d
+                break
+              }
+            }
+            if (-not $found) {
+              Write-Host "No local ffmpeg found; downloading portable build..."
+              $temp = Join-Path $env:RUNNER_TEMP "ffmpeg"
+              New-Item -ItemType Directory -Force -Path $temp | Out-Null
+              $zip = Join-Path $temp "ffmpeg.zip"
+              try {
+                Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
+              } catch {
+                & curl.exe -L "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o $zip
+              }
+              Expand-Archive -Path $zip -DestinationPath $temp -Force
+              $bin = Get-ChildItem -Path $temp -Recurse -Directory |
+                Where-Object { Test-Path (Join-Path $_.FullName "bin\ffmpeg.exe") } |
+                Select-Object -First 1
+              if (-not $bin) { throw "ffmpeg bin folder not found after extract." }
+              Add-ToPath (Join-Path $bin.FullName "bin") | Out-Null
+            }
+          }
+
+          ffmpeg -version | Select-Object -First 1
 
       - name: Ensure Firefox is closed & profile exists
         shell: powershell
@@ -202,7 +248,6 @@ jobs:
             '    if txt.endswith(("؟","!",".")): score += 0.5',
             '    rows.append({**s, "score": float(score), "dur": dur})',
             '',
-            'import pandas as pd',
             'df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False,True])',
             'TOPN = int("' + '${{ inputs.topN }}' + '")',
             'top = df.head(TOPN)',
