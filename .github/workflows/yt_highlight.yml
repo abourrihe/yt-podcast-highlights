@@ -168,14 +168,19 @@ jobs:
       - name: Normalize to MP4 (transcode if needed)
         shell: powershell
         run: |
-          $in = Get-ChildItem -Name "input.*" | Select-Object -First 1
-          if (-not $in) { Write-Error "No input.* found after download." ; exit 1 }
-          if ($in -notlike "*.mp4") {
-            Write-Host "Converting $in -> input.mp4 (libx264/aac)"
-            ffmpeg -y -i "$in" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
+          $file = Get-ChildItem -File input.* | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $file) { Write-Error "No input.* found after download." ; exit 1 }
+
+          if ($file.Extension -ieq ".mp4") {
+            if ($file.Name -ieq "input.mp4") {
+              Write-Host "Already MP4 and correctly named input.mp4."
+            } else {
+              Write-Host "MP4 already; renaming $($file.Name) -> input.mp4"
+              Copy-Item -Force -LiteralPath $file.FullName -Destination "input.mp4"
+            }
           } else {
-            Write-Host "Already MP4."
-            Copy-Item -Force "$in" "input.mp4"
+            Write-Host "Converting $($file.Name) -> input.mp4 (libx264/aac)"
+            ffmpeg -y -i "$($file.FullName)" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
           }
 
       - name: Extract audio to WAV (16k mono)
