@@ -1,10 +1,10 @@
-name: YouTube Highlight (Windows + Firefox, WEB client)
+name: YouTube Highlights (Windows + Firefox, Arabic E2E)
 
 on:
   workflow_dispatch:
     inputs:
       videoId:
-        description: "YouTube Video ID (e.g., dQw4w9WgXcQ)"
+        description: "YouTube Video ID (e.g., S9a1nLw70p0)"
         required: true
         type: string
       profile:
@@ -12,10 +12,27 @@ on:
         required: true
         default: "yov4tydr.default-release-3"
         type: string
-      format:
-        description: "yt-dlp format selector"
-        required: false
-        default: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+      whisper_model:
+        description: "Whisper model for transcription (bigger = better but slower)"
+        required: true
+        default: "medium"
+        type: choice
+        options: [tiny, base, small, medium]
+      topN:
+        description: "How many top highlight segments to export"
+        required: true
+        default: "8"
+        type: choice
+        options: ["5","8","10","12"]
+      padPre:
+        description: "Seconds of padding before each clip"
+        required: true
+        default: "0.6"
+        type: string
+      padPost:
+        description: "Seconds of padding after each clip"
+        required: true
+        default: "0.6"
         type: string
 
 jobs:
@@ -23,7 +40,7 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Allow PowerShell scripts (CurrentUser)
@@ -35,30 +52,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install yt-dlp
+      - name: Install deps (pinned)
         shell: powershell
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp
+          pip install yt-dlp==2025.01.26
+          pip install faster-whisper==1.0.3 pandas==2.2.2
 
-      - name: Ensure Firefox is closed
+      - name: Check ffmpeg availability
+        shell: powershell
+        run: |
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            ffmpeg -version | Select-Object -First 1
+          } else {
+            Write-Error "ffmpeg not found on PATH. Install ffmpeg and rerun." ; exit 1
+          }
+
+      - name: Ensure Firefox is closed & profile exists
         shell: powershell
         run: |
           if (Get-Process firefox -ErrorAction SilentlyContinue) {
-            Write-Error "Firefox is running. Please close all Firefox windows before starting the run."
-            exit 1
+            Write-Error "Firefox is running. Close all Firefox windows, then rerun." ; exit 1
           }
-
-      - name: Validate Firefox profile
-        shell: powershell
-        run: |
           $base = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
           $prof = '${{ inputs.profile }}'
           $path = Join-Path $base $prof
           Write-Host "Checking profile at: $path"
           if (-not (Test-Path $path)) {
-            Write-Error "Firefox profile '$prof' not found under $base. Open about:profiles and copy the folder name."
-            exit 1
+            Write-Error "Firefox profile '$prof' not found under $base. Open about:profiles and copy the folder name." ; exit 1
           }
 
       - name: List formats (WEB client) and save output
@@ -67,29 +88,171 @@ jobs:
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           Write-Host "Using cookies-from-browser = $CFB"
-          Write-Host "FORCING WEB CLIENT"
           yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  -F $URL | Tee-Object -FilePath list-formats.txt
 
-      - name: Download (WEB client)
+      - name: Download video (WEB client → input.*)
         shell: powershell
         run: |
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
-          $FMT = '${{ inputs.format }}'
+          # Prefer mp4; fallback to best
+          $FMT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
           yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  -o "input.%(ext)s" -f $FMT `
                  $URL
 
-      - name: Upload artifacts
+          Write-Host "Files after download:"
+          Get-ChildItem -Force | Format-Table -AutoSize
+
+      - name: Normalize to MP4 (transcode if needed)
+        shell: powershell
+        run: |
+          $in = Get-ChildItem -Name "input.*" | Select-Object -First 1
+          if (-not $in) { Write-Error "No input.* found after download." ; exit 1 }
+          if ($in -notlike "*.mp4") {
+            Write-Host "Converting $in -> input.mp4 (libx264/aac)"
+            ffmpeg -y -i "$in" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
+          } else {
+            Write-Host "Already MP4."
+            Copy-Item -Force "$in" "input.mp4"
+          }
+
+      - name: Extract audio to WAV (16k mono)
+        shell: powershell
+        run: |
+          ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
+
+      - name: Transcribe with faster-whisper (Arabic bias) → transcript.json/srt
+        shell: powershell
+        run: |
+          python - << 'PY'
+import json, math
+from datetime import timedelta
+from faster_whisper import WhisperModel
+
+model_size = "${{ inputs.whisper_model }}"
+# CPU-friendly INT8; if you have GPU later, change device="cuda"
+model = WhisperModel(model_size, device="cpu", compute_type="int8")
+
+segments, info = model.transcribe(
+    "audio.wav",
+    language="ar",            # bias to Arabic
+    vad_filter=True,
+    beam_size=5,
+    no_speech_threshold=0.45,
+    compression_ratio_threshold=2.4
+)
+
+out = []
+for seg in segments:
+    out.append({
+        "start": round(seg.start, 2),
+        "end": round(seg.end, 2),
+        "text": seg.text.strip()
+    })
+
+with open("transcript.json", "w", encoding="utf-8") as f:
+    json.dump({"language": "ar", "segments": out}, f, ensure_ascii=False, indent=2)
+
+def fmt_time(t):
+    ms = int((t - int(t))*1000)
+    td = timedelta(seconds=int(t))
+    hh = int(td.total_seconds()//3600)
+    mm = int((td.total_seconds()%3600)//60)
+    ss = int(td.total_seconds()%60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+with open("transcript.srt", "w", encoding="utf-8") as f:
+    for i, s in enumerate(out, 1):
+        f.write(f"{i}\n{fmt_time(s['start'])} --> {fmt_time(s['end'])}\n{s['text']}\n\n")
+PY
+
+      - name: Score Arabic highlights → highlights.json/txt
+        shell: powershell
+        run: |
+          python - << 'PY'
+import json, re, pandas as pd
+
+with open("transcript.json","r",encoding="utf-8") as f:
+    data = json.load(f)
+segs = data["segments"]
+
+# Arabic cues: question words, superlatives, problem/solution, advice, numbers (Arabic & Latin), punctuation
+arabic_keywords = [
+  r"لماذا|ليش|ليه|كيف|ماذا|شنو|ايش|شو|متى|أين|وين|من|كم|هل",
+  r"أفضل|أحسن|أكبر|أصغر|أهم|أقوى|أسرع|أغلى|أرخص|الأفضل|الأهم",
+  r"مشكلة|حل|سر|نصيحة|خدعة|طريقة|استراتيجية|إستراتيجية|حقيقة|تحذير|خطأ|أرباح|خسارة|نمو|صفقة|استثمار|نتيجة",
+  r"[0-9٠-٩]+|٪|%",
+  r"؟|!"
+]
+pat = re.compile("|".join(f"(?:{p})" for p in arabic_keywords))
+
+rows=[]
+for s in segs:
+    txt = s["text"]
+    score = 0
+    # base: keyword hits
+    score += len(pat.findall(txt))
+    # duration preference: 4–25s best for clips
+    dur = s["end"] - s["start"]
+    if 4.0 <= dur <= 25.0: score += 1
+    # boost if line ends with punctuation (emphasis)
+    if txt.endswith(("؟","!",".")): score += 0.5
+    rows.append({**s, "score": float(score), "dur": dur})
+
+df = pd.DataFrame(rows)
+df = df.sort_values(["score","dur"], ascending=[False,True])
+TOPN = int("${{ inputs.topN }}")
+top = df.head(TOPN)
+
+top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)
+
+with open("highlights.txt","w",encoding="utf-8") as f:
+    for i, r in enumerate(top.itertuples(), 1):
+        f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")
+PY
+
+      - name: Export highlight clips (MP4)
+        shell: powershell
+        run: |
+          python - << 'PY'
+import json, os, subprocess
+PAD_PRE = float("${{ inputs.padPre }}")
+PAD_POST= float("${{ inputs.padPost }}")
+
+with open("highlights.json","r",encoding="utf-8") as f:
+    segs = json.load(f)
+
+os.makedirs("clips", exist_ok=True)
+for i, s in enumerate(segs, 1):
+    ss = max(0.0, s["start"] - PAD_PRE)
+    to = max(0.1, (s["end"] + PAD_POST) - ss)
+    out = f"clips/clip_{i:02d}.mp4"
+    cmd = [
+        "ffmpeg","-y",
+        "-ss", f"{ss:.3f}", "-i", "input.mp4",
+        "-t", f"{to:.3f}",
+        "-c:v","libx264","-preset","veryfast","-crf","22",
+        "-c:a","aac","-b:a","128k",
+        out
+    ]
+    subprocess.run(cmd, check=True)
+PY
+
+      - name: Upload artifacts (formats, transcript, highlights, clips)
         uses: actions/upload-artifact@v4
         with:
-          name: yt-debug-and-source
+          name: highlights-output
           path: |
             list-formats.txt
-            input*.mp4
-            input*.mkv
-            input*.webm
+            input.mp4
+            audio.wav
+            transcript.json
+            transcript.srt
+            highlights.json
+            highlights.txt
+            clips/*.mp4
           if-no-files-found: warn
