@@ -13,24 +13,24 @@ on:
         default: "yov4tydr.default-release-3"
         type: string
       whisper_model:
-        description: "Whisper model for transcription (bigger = better but slower)"
+        description: "Whisper model (bigger = better but slower)"
         required: true
         default: "medium"
         type: choice
         options: [tiny, base, small, medium]
       topN:
-        description: "How many top highlight segments to export"
+        description: "How many highlight segments to export"
         required: true
         default: "8"
         type: choice
         options: ["5","8","10","12"]
       padPre:
-        description: "Seconds of padding before each clip"
+        description: "Seconds padding before each clip"
         required: true
         default: "0.6"
         type: string
       padPost:
-        description: "Seconds of padding after each clip"
+        description: "Seconds padding after each clip"
         required: true
         default: "0.6"
         type: string
@@ -88,6 +88,7 @@ jobs:
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           Write-Host "Using cookies-from-browser = $CFB"
+          Write-Host "FORCING WEB CLIENT"
           yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  -F $URL | Tee-Object -FilePath list-formats.txt
@@ -97,13 +98,11 @@ jobs:
         run: |
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
-          # Prefer mp4; fallback to best
           $FMT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
           yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  -o "input.%(ext)s" -f $FMT `
                  $URL
-
           Write-Host "Files after download:"
           Get-ChildItem -Force | Format-Table -AutoSize
 
@@ -122,24 +121,22 @@ jobs:
 
       - name: Extract audio to WAV (16k mono)
         shell: powershell
-        run: |
-          ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
+        run: ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
 
       - name: Transcribe with faster-whisper (Arabic bias) → transcript.json/srt
         shell: powershell
         run: |
-          python - << 'PY'
-import json, math
+          $code = @'
+import json
 from datetime import timedelta
 from faster_whisper import WhisperModel
 
 model_size = "${{ inputs.whisper_model }}"
-# CPU-friendly INT8; if you have GPU later, change device="cuda"
 model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
 segments, info = model.transcribe(
     "audio.wav",
-    language="ar",            # bias to Arabic
+    language="ar",
     vad_filter=True,
     beam_size=5,
     no_speech_threshold=0.45,
@@ -168,19 +165,21 @@ def fmt_time(t):
 with open("transcript.srt", "w", encoding="utf-8") as f:
     for i, s in enumerate(out, 1):
         f.write(f"{i}\n{fmt_time(s['start'])} --> {fmt_time(s['end'])}\n{s['text']}\n\n")
-PY
+'@
+          Set-Content -Path transcribe.py -Value $code -Encoding UTF8
+          python transcribe.py
 
       - name: Score Arabic highlights → highlights.json/txt
         shell: powershell
         run: |
-          python - << 'PY'
-import json, re, pandas as pd
+          $code = @'
+import json, re
+import pandas as pd
 
 with open("transcript.json","r",encoding="utf-8") as f:
     data = json.load(f)
 segs = data["segments"]
 
-# Arabic cues: question words, superlatives, problem/solution, advice, numbers (Arabic & Latin), punctuation
 arabic_keywords = [
   r"لماذا|ليش|ليه|كيف|ماذا|شنو|ايش|شو|متى|أين|وين|من|كم|هل",
   r"أفضل|أحسن|أكبر|أصغر|أهم|أقوى|أسرع|أغلى|أرخص|الأفضل|الأهم",
@@ -194,31 +193,28 @@ rows=[]
 for s in segs:
     txt = s["text"]
     score = 0
-    # base: keyword hits
     score += len(pat.findall(txt))
-    # duration preference: 4–25s best for clips
     dur = s["end"] - s["start"]
     if 4.0 <= dur <= 25.0: score += 1
-    # boost if line ends with punctuation (emphasis)
     if txt.endswith(("؟","!",".")): score += 0.5
     rows.append({**s, "score": float(score), "dur": dur})
 
-df = pd.DataFrame(rows)
-df = df.sort_values(["score","dur"], ascending=[False,True])
+df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False,True])
 TOPN = int("${{ inputs.topN }}")
 top = df.head(TOPN)
 
 top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)
-
 with open("highlights.txt","w",encoding="utf-8") as f:
     for i, r in enumerate(top.itertuples(), 1):
         f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")
-PY
+'@
+          Set-Content -Path score_ar.py -Value $code -Encoding UTF8
+          python score_ar.py
 
       - name: Export highlight clips (MP4)
         shell: powershell
         run: |
-          python - << 'PY'
+          $code = @'
 import json, os, subprocess
 PAD_PRE = float("${{ inputs.padPre }}")
 PAD_POST= float("${{ inputs.padPost }}")
@@ -240,7 +236,9 @@ for i, s in enumerate(segs, 1):
         out
     ]
     subprocess.run(cmd, check=True)
-PY
+'@
+          Set-Content -Path export_clips.py -Value $code -Encoding UTF8
+          python export_clips.py
 
       - name: Upload artifacts (formats, transcript, highlights, clips)
         uses: actions/upload-artifact@v4
