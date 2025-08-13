@@ -59,7 +59,7 @@ jobs:
           pip install --pre --upgrade yt-dlp
           pip install faster-whisper==1.0.3 pandas==2.2.2
 
-      # Force UTF-8 across the job to prevent mojibake & quoting issues
+      # Force UTF-8 so Arabic + quotes survive writing from PowerShell
       - name: Force UTF-8 for PS & Python
         shell: powershell
         run: |
@@ -199,145 +199,135 @@ jobs:
         shell: powershell
         run: ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
 
-      # -------------------- UTF-8 safe Python writers --------------------
+      # -------------------- Python writers (no here-strings) --------------------
 
-      - name: Write transcribe.py (UTF-8 safe)
+      - name: Write transcribe.py
         shell: powershell
         run: |
-          $MODEL = '${{ inputs.whisper_model }}'
-          $py = @'
-import json
-from datetime import timedelta
-from faster_whisper import WhisperModel
-
-model_size = "WHISPER_MODEL_PLACEHOLDER"
-model = WhisperModel(model_size, device="cpu", compute_type="int8")
-
-segments, info = model.transcribe(
-    "audio.wav",
-    language="ar",
-    vad_filter=True,
-    beam_size=5,
-    no_speech_threshold=0.45,
-    compression_ratio_threshold=2.4
-)
-
-out = []
-for seg in segments:
-    out.append({
-        "start": round(seg.start, 2),
-        "end": round(seg.end, 2),
-        "text": seg.text.strip()
-    })
-
-with open("transcript.json", "w", encoding="utf-8") as f:
-    json.dump({"language": "ar", "segments": out}, f, ensure_ascii=False, indent=2)
-
-def fmt_time(t: float) -> str:
-    ms = int((t - int(t)) * 1000)
-    td_sec = int(t)
-    hh = td_sec // 3600
-    mm = (td_sec % 3600) // 60
-    ss = td_sec % 60
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-with open("transcript.srt", "w", encoding="utf-8") as f:
-    for i, s in enumerate(out, 1):
-        f.write(f"{i}\n{fmt_time(s['start'])} --> {fmt_time(s['end'])}\n{s['text']}\n\n")
-'@
-          $py = $py.Replace('WHISPER_MODEL_PLACEHOLDER', $MODEL)
-          Set-Content -Path transcribe.py -Value $py -Encoding UTF8
-          Get-Content transcribe.py -TotalCount 12
+          $MODEL = '${{ inputs.whisper_model }}'  # tiny/base/small/medium
+          $lines = @(
+            'import json',
+            'from datetime import timedelta',
+            'from faster_whisper import WhisperModel',
+            '',
+            "model_size = `"$MODEL`"",
+            'model = WhisperModel(model_size, device="cpu", compute_type="int8")',
+            '',
+            'segments, info = model.transcribe(',
+            '    "audio.wav",',
+            '    language="ar",',
+            '    vad_filter=True,',
+            '    beam_size=5,',
+            '    no_speech_threshold=0.45,',
+            '    compression_ratio_threshold=2.4',
+            ')',
+            '',
+            'out = []',
+            'for seg in segments:',
+            '    out.append({',
+            '        "start": round(seg.start, 2),',
+            '        "end": round(seg.end, 2),',
+            '        "text": seg.text.strip()',
+            '    })',
+            '',
+            'with open("transcript.json", "w", encoding="utf-8") as f:',
+            '    json.dump({"language": "ar", "segments": out}, f, ensure_ascii=False, indent=2)',
+            '',
+            'def fmt_time(t):',
+            '    ms = int((t - int(t))*1000)',
+            '    td = timedelta(seconds=int(t))',
+            '    hh = int(td.total_seconds()//3600)',
+            '    mm = int((td.total_seconds()%3600)//60)',
+            '    ss = int(td.total_seconds()%60)',
+            '    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"',
+            '',
+            'with open("transcript.srt", "w", encoding="utf-8") as f:',
+            '    for i, s in enumerate(out, 1):',
+            '        f.write(f"{i}\n{fmt_time(s[''start''])} --> {fmt_time(s[''end''])}\n{s[''text'']}\n\n")'
+          )
+          [IO.File]::WriteAllText("transcribe.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
+          Get-Content transcribe.py -TotalCount 8
 
       - name: Transcribe (run)
         shell: powershell
         run: python transcribe.py
 
-      - name: Write score_ar.py (UTF-8 safe)
+      - name: Write score_ar.py
         shell: powershell
         run: |
           $TOPN = '${{ inputs.topN }}'  # "5","8","10","12"
-          $py = @'
-import json, re
-import pandas as pd
-
-with open("transcript.json","r",encoding="utf-8") as f:
-    data = json.load(f)
-segs = data.get("segments", [])
-
-# Arabic cues
-arabic_keywords = [
-  r"لماذا|ليش|ليه|كيف|ماذا|شنو|ايش|شو|متى|أين|وين|من|كم|هل",
-  r"أفضل|أحسن|أكبر|أصغر|أهم|أقوى|أسرع|أغلى|أرخص|الأفضل|الأهم",
-  r"مشكلة|حل|سر|نصيحة|خدعة|طريقة|استراتيجية|إستراتيجية|حقيقة|تحذير|خطأ|أرباح|خسارة|نمو|صفقة|استثمار|نتيجة",
-  r"[0-9٠-٩]+|٪|%",
-  r"؟|!"
-]
-pat = re.compile("|".join(f"(?:{p})" for p in arabic_keywords))
-
-rows = []
-for s in segs:
-  txt = s["text"]
-  score = 0.0
-  score += len(pat.findall(txt))
-  dur = s["end"] - s["start"]
-  if 4.0 <= dur <= 25.0:
-    score += 1.0
-  if txt.endswith(("؟","!",".")):
-    score += 0.5
-  rows.append({**s, "score": float(score), "dur": dur})
-
-df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False, True])
-
-TOPN = int("TOPN_PLACEHOLDER")
-top = df.head(TOPN)
-
-top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)
-with open("highlights.txt","w",encoding="utf-8") as f:
-  for i, r in enumerate(top.itertuples(), 1):
-    f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")
-'@
-          $py = $py.Replace('TOPN_PLACEHOLDER', $TOPN)
-          Set-Content -Path score_ar.py -Value $py -Encoding UTF8
-          Get-Content score_ar.py -TotalCount 12
+          $lines = @(
+            'import json, re',
+            'import pandas as pd',
+            '',
+            'with open("transcript.json","r",encoding="utf-8") as f:',
+            '    data = json.load(f)',
+            'segs = data["segments"]',
+            '',
+            '# Arabic cues',
+            'arabic_keywords = [',
+            '  r"لماذا|ليش|ليه|كيف|ماذا|شنو|ايش|شو|متى|أين|وين|من|كم|هل",',
+            '  r"أفضل|أحسن|أكبر|أصغر|أهم|أقوى|أسرع|أغلى|أرخص|الأفضل|الأهم",',
+            '  r"مشكلة|حل|سر|نصيحة|خدعة|طريقة|استراتيجية|إستراتيجية|حقيقة|تحذير|خطأ|أرباح|خسارة|نمو|صفقة|استثمار|نتيجة",',
+            '  r"[0-9٠-٩]+|٪|%",',
+            '  r"؟|!"',
+            ']',
+            'pat = re.compile("|".join(f"(?:{p})" for p in arabic_keywords))',
+            '',
+            'rows=[]',
+            'for s in segs:',
+            '    txt = s["text"]',
+            '    score = 0.0',
+            '    score += len(pat.findall(txt))',
+            '    dur = s["end"] - s["start"]',
+            '    if 4.0 <= dur <= 25.0: score += 1.0',
+            '    if txt.endswith(("؟","!",".")): score += 0.5',
+            '    rows.append({**s, "score": float(score), "dur": dur})',
+            '',
+            'df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False,True])',
+            ("TOPN = int(\"{0}\")" -f $TOPN),
+            'top = df.head(TOPN)',
+            '',
+            'top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)',
+            'with open("highlights.txt","w",encoding="utf-8") as f:',
+            '    for i, r in enumerate(top.itertuples(), 1):',
+            '        f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")'
+          )
+          [IO.File]::WriteAllText("score_ar.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
+          Get-Content score_ar.py -TotalCount 8
 
       - name: Score highlights (run)
         shell: powershell
         run: python score_ar.py
 
-      - name: Write export_clips.py (UTF-8 safe)
+      - name: Write export_clips.py
         shell: powershell
         run: |
-          $PAD_PRE  = '${{ inputs.padPre }}'
-          $PAD_POST = '${{ inputs.padPost }}'
-          $py = @'
-import json, os, subprocess
-
-PAD_PRE  = float("PAD_PRE_PLACEHOLDER")
-PAD_POST = float("PAD_POST_PLACEHOLDER")
-
-with open("highlights.json","r",encoding="utf-8") as f:
-  segs = json.load(f)
-
-os.makedirs("clips", exist_ok=True)
-for i, s in enumerate(segs, 1):
-  ss = max(0.0, s["start"] - PAD_PRE)
-  to = max(0.1, (s["end"] + PAD_POST) - ss)
-  out = f"clips/clip_{i:02d}.mp4"
-  cmd = [
-    "ffmpeg","-y",
-    "-ss", f"{ss:.3f}", "-i", "input.mp4",
-    "-t", f"{to:.3f}",
-    "-c:v","libx264","-preset","veryfast","-crf","22",
-    "-c:a","aac","-b:a","128k",
-    out
-  ]
-  subprocess.run(cmd, check=True)
-'@
-          $py = $py.Replace('PAD_PRE_PLACEHOLDER',  $PAD_PRE)
-          $py = $py.Replace('PAD_POST_PLACEHOLDER', $PAD_POST)
-          Set-Content -Path export_clips.py -Value $py -Encoding UTF8
-          Get-Content export_clips.py -TotalCount 10
+          $lines = @(
+            'import json, os, subprocess',
+            'PAD_PRE = float("' + '${{ inputs.padPre }}' + '")',
+            'PAD_POST= float("' + '${{ inputs.padPost }}' + '")',
+            '',
+            'with open("highlights.json","r",encoding="utf-8") as f:',
+            '    segs = json.load(f)',
+            '',
+            'os.makedirs("clips", exist_ok=True)',
+            'for i, s in enumerate(segs, 1):',
+            '    ss = max(0.0, s["start"] - PAD_PRE)',
+            '    to = max(0.1, (s["end"] + PAD_POST) - ss)',
+            '    out = f"clips/clip_{i:02d}.mp4"',
+            '    cmd = [',
+            '        "ffmpeg","-y",',
+            '        "-ss", f"{ss:.3f}", "-i", "input.mp4",',
+            '        "-t", f"{to:.3f}",',
+            '        "-c:v","libx264","-preset","veryfast","-crf","22",',
+            '        "-c:a","aac","-b:a","128k",',
+            '        out',
+            '    ]',
+            '    subprocess.run(cmd, check=True)'
+          )
+          [IO.File]::WriteAllText("export_clips.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
+          Get-Content export_clips.py -TotalCount 8
 
       - name: Export highlight clips (run)
         shell: powershell
