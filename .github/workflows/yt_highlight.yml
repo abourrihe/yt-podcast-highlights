@@ -59,7 +59,7 @@ jobs:
           pip install --pre --upgrade yt-dlp
           pip install faster-whisper==1.0.3 pandas==2.2.2
 
-      # ---- NEW: force UTF-8 so Arabic text & regex are written correctly ----
+      # Force UTF-8 across the job to prevent mojibake & quoting issues
       - name: Force UTF-8 for PS & Python
         shell: powershell
         run: |
@@ -77,7 +77,7 @@ jobs:
 
           function Add-ToCurrentAndNextSteps([string]$dir) {
             if (-not (Test-Path $dir)) { return $false }
-            $env:Path = "$dir;$env:Path"   # current step
+            $env:Path = "$dir;$env:Path"
             $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
             Write-Host "Using ffmpeg at: $dir"
             return $true
@@ -151,7 +151,6 @@ jobs:
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           $FMT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
 
-          # Try 1: web client
           yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  --retries 5 --extractor-retries 5 `
