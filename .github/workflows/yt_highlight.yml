@@ -63,6 +63,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+
           function Add-ToCurrentAndNextSteps([string]$dir) {
             if (-not (Test-Path $dir)) { return $false }
             $env:Path = "$dir;$env:Path"
@@ -70,9 +71,10 @@ jobs:
             Write-Host "Using ffmpeg at: $dir"
             return $true
           }
+
           $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
           if (-not $cmd) {
-            Write-Host "ffmpeg not on PATH. Searching..."
+            Write-Host "ffmpeg not on PATH. Searching common locations..."
             $candidates = @(
               "C:\ffmpeg\bin",
               "C:\Program Files\ffmpeg\bin",
@@ -85,7 +87,7 @@ jobs:
               if (Test-Path (Join-Path $d "ffmpeg.exe")) { $found = Add-ToCurrentAndNextSteps $d; break }
             }
             if (-not $found) {
-              Write-Host "Downloading portable ffmpeg..."
+              Write-Host "No local ffmpeg found; downloading portable build..."
               $temp = Join-Path $env:RUNNER_TEMP "ffmpeg"
               New-Item -ItemType Directory -Force -Path $temp | Out-Null
               $zip = Join-Path $temp "ffmpeg.zip"
@@ -95,196 +97,286 @@ jobs:
               $bin = Get-ChildItem -Path $temp -Recurse -Directory |
                 Where-Object { Test-Path (Join-Path $_.FullName "bin\ffmpeg.exe") } |
                 Select-Object -First 1
-              if (-not $bin) { throw "ffmpeg bin folder not found." }
+              if (-not $bin) { throw "ffmpeg bin folder not found after extract." }
               Add-ToCurrentAndNextSteps (Join-Path $bin.FullName "bin") | Out-Null
             }
           } else {
-            Write-Host "ffmpeg found: $($cmd.Source)"
+            Write-Host "ffmpeg already on PATH at: $($cmd.Source)"
           }
+
           ffmpeg -version | Select-Object -First 1
 
       - name: Ensure Firefox is closed & profile exists
         shell: powershell
         run: |
           if (Get-Process firefox -ErrorAction SilentlyContinue) {
-            Write-Error "Firefox is running. Close all Firefox windows." ; exit 1
+            Write-Error "Firefox is running. Close all Firefox windows, then rerun." ; exit 1
           }
           $base = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
           $prof = '${{ inputs.profile }}'
           $path = Join-Path $base $prof
+          Write-Host "Checking profile at: $path"
           if (-not (Test-Path $path)) {
-            Write-Error "Profile '$prof' not found under $base." ; exit 1
+            Write-Error "Firefox profile '$prof' not found under $base. Open about:profiles and copy the folder name." ; exit 1
           }
 
-      - name: List formats
+      - name: List formats (WEB client) and save output
         shell: powershell
         run: |
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
-          yt-dlp --cookies-from-browser $CFB `
+          yt-dlp --verbose --cookies-from-browser $CFB `
                  --extractor-args "youtube:player_client=web" `
                  -F $URL | Tee-Object -FilePath list-formats.txt
 
-      - name: Download video
+      - name: Download video (WEB client → fallback → best)
         shell: powershell
         run: |
           $CFB = "firefox:${{ inputs.profile }}"
           $URL = "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           $FMT = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-          yt-dlp --cookies-from-browser $CFB --extractor-args "youtube:player_client=web" -o "input.%(ext)s" -f $FMT $URL
+
+          yt-dlp --verbose --cookies-from-browser $CFB `
+                 --extractor-args "youtube:player_client=web" `
+                 --retries 5 --extractor-retries 5 `
+                 -o "input.%(ext)s" -f $FMT `
+                 $URL
           if ($LASTEXITCODE -ne 0) {
-            yt-dlp --cookies-from-browser $CFB --extractor-args "youtube:player_client=web_safari" -o "input.%(ext)s" -f $FMT $URL
+            yt-dlp --verbose --cookies-from-browser $CFB `
+                   --extractor-args "youtube:player_client=web_safari" `
+                   --retries 5 --extractor-retries 5 `
+                   -o "input.%(ext)s" -f $FMT `
+                   $URL
+            if ($LASTEXITCODE -ne 0) {
+              yt-dlp --verbose --cookies-from-browser $CFB `
+                     --extractor-args "youtube:player_client=web_safari" `
+                     --retries 5 --extractor-retries 5 `
+                     -o "input.%(ext)s" -f best `
+                     $URL
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
           }
 
-      - name: Normalize to MP4
+          Write-Host "Files after download:"
+          Get-ChildItem -Force | Format-Table -AutoSize
+
+      - name: Normalize to MP4 (transcode if needed)
         shell: powershell
         run: |
-          $file = Get-ChildItem -File input.* | Select-Object -First 1
-          if ($file.Extension -ne ".mp4") {
+          $file = Get-ChildItem -File input.* | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $file) { Write-Error "No input.* found after download." ; exit 1 }
+
+          if ($file.Extension -ieq ".mp4") {
+            if ($file.Name -ieq "input.mp4") {
+              Write-Host "Already MP4 and correctly named input.mp4."
+            } else {
+              Copy-Item -Force -LiteralPath $file.FullName -Destination "input.mp4"
+            }
+          } else {
             ffmpeg -y -i "$($file.FullName)" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
-          } elseif ($file.Name -ne "input.mp4") {
-            Copy-Item -Force $file.FullName -Destination "input.mp4"
           }
 
-      - name: Extract audio
+      - name: Extract audio to WAV (16k mono)
         shell: powershell
         run: ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
 
+      # --------- Write transcribe.py (ASCII-only PowerShell) ---------
       - name: Write transcribe.py
         shell: powershell
         run: |
           $MODEL = '${{ inputs.whisper_model }}'
-          $code = @'
-import json
-from datetime import timedelta
-from faster_whisper import WhisperModel
+          $lines = @(
+            'import json',
+            'from datetime import timedelta',
+            'from faster_whisper import WhisperModel',
+            '',
+            "model_size = `"$MODEL`"",
+            'model = WhisperModel(model_size, device="cpu", compute_type="int8")',
+            '',
+            'segments, info = model.transcribe(',
+            '    "audio.wav",',
+            '    language="ar",',
+            '    vad_filter=True,',
+            '    beam_size=5,',
+            '    no_speech_threshold=0.45,',
+            '    compression_ratio_threshold=2.4',
+            ')',
+            '',
+            'out = []',
+            'for seg in segments:',
+            '    out.append({',
+            '        "start": round(seg.start, 2),',
+            '        "end": round(seg.end, 2),',
+            '        "text": seg.text.strip()',
+            '    })',
+            '',
+            'with open("transcript.json", "w", encoding="utf-8") as f:',
+            '    json.dump({"language": "ar", "segments": out}, f, ensure_ascii=False, indent=2)',
+            '',
+            'def fmt_time(t):',
+            '    ms = int((t - int(t))*1000)',
+            '    hh = int(t // 3600)',
+            '    mm = int((t % 3600) // 60)',
+            '    ss = int(t % 60)',
+            '    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"',
+            '',
+            'with open("transcript.srt", "w", encoding="utf-8") as f:',
+            '    for i, s in enumerate(out, 1):',
+            '        f.write(f"{i}\n{fmt_time(s[''start''])} --> {fmt_time(s[''end''])}\n{s[''text'']}\n\n")'
+          )
+          [IO.File]::WriteAllText("transcribe.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
 
-model_size = "@MODEL@"
-model = WhisperModel(model_size, device="cpu", compute_type="int8")
-
-segments, info = model.transcribe(
-    "audio.wav",
-    language="ar",
-    vad_filter=True,
-    beam_size=5,
-    no_speech_threshold=0.45,
-    compression_ratio_threshold=2.4
-)
-
-out = []
-for seg in segments:
-    out.append({
-        "start": round(seg.start, 2),
-        "end": round(seg.end, 2),
-        "text": seg.text.strip()
-    })
-
-with open("transcript.json", "w", encoding="utf-8") as f:
-    json.dump({"language": "ar", "segments": out}, f, ensure_ascii=False, indent=2)
-
-def fmt_time(t):
-    ms = int((t - int(t))*1000)
-    hh = int(t // 3600)
-    mm = int((t % 3600) // 60)
-    ss = int(t % 60)
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-with open("transcript.srt", "w", encoding="utf-8") as f:
-    for i, s in enumerate(out, 1):
-        f.write(f"{i}\n{fmt_time(s['start'])} --> {fmt_time(s['end'])}\n{s['text']}\n\n")
-'@
-          $code = $code.Replace("@MODEL@", $MODEL)
-          [IO.File]::WriteAllText("transcribe.py", $code, [Text.Encoding]::UTF8)
-
-      - name: Transcribe
+      - name: Transcribe (run)
         shell: powershell
         run: python transcribe.py
 
+      # --------- Write score_ar.py (Arabic via \uXXXX, ASCII-only PS) ---------
       - name: Write score_ar.py
         shell: powershell
         run: |
           $TOPN = '${{ inputs.topN }}'
-          $code = @'
-import json, re
-import pandas as pd
+          $topLine = 'TOPN = ' + ([int]$TOPN)
+          $lines = @(
+            'import json, re',
+            'import pandas as pd',
+            '',
+            'with open("transcript.json","r",encoding="utf-8") as f:',
+            '    data = json.load(f)',
+            'segs = data.get("segments", [])',
+            '',
+            '# Arabic keyword lists encoded as \\uXXXX to avoid encoding issues',
+            'question_words = [' +
+              '"\\u0644\\u0645\\u0627\\u0630\\u0627",' +  # لماذا
+              '"\\u0644\\u064a\\u0634",' +                # ليش
+              '"\\u0644\\u064a\\u0647",' +                # ليه
+              '"\\u0643\\u064a\\u0641",' +                # كيف
+              '"\\u0645\\u0627\\u0630\\u0627",' +        # ماذا
+              '"\\u0634\\u0646\\u0648",' +                # شنو
+              '"\\u0627\\u064a\\u0634",' +                # ايش
+              '"\\u0634\\u0648",' +                      # شو
+              '"\\u0645\\u062a\\u0649",' +                # متى
+              '"\\u0623\\u064a\\u0646",' +                # أين
+              '"\\u0648\\u064a\\u0646",' +                # وين
+              '"\\u0645\\u0646",' +                      # من
+              '"\\u0643\\u0645",' +                      # كم
+              '"\\u0647\\u0644"' +                       # هل
+            ']',
+            'superlatives = [' +
+              '"\\u0623\\u0641\\u0636\\u0644",' +
+              '"\\u0623\\u062d\\u0633\\u0646",' +
+              '"\\u0623\\u0643\\u0628\\u0631",' +
+              '"\\u0623\\u0635\\u063a\\u0631",' +
+              '"\\u0623\\u0647\\u0645",' +
+              '"\\u0623\\u0642\\u0648\\u0649",' +
+              '"\\u0623\\u0633\\u0631\\u0639",' +
+              '"\\u0623\\u063a\\u0644\\u0649",' +
+              '"\\u0623\\u0631\\u062e\\u0635",' +
+              '"\\u0627\\u0644\\u0623\\u0641\\u0636\\u0644",' +
+              '"\\u0627\\u0644\\u0623\\u0647\\u0645"' +
+            ']',
+            'topic_words = [' +
+              '"\\u0645\\u0634\\u0643\\u0644\\u0629",' +
+              '"\\u062d\\u0644",' +
+              '"\\u0633\\u0631",' +
+              '"\\u0646\\u0635\\u064a\\u062d\\u0629",' +
+              '"\\u062e\\u062f\\u0639\\u0629",' +
+              '"\\u0637\\u0631\\u064a\\u0642\\u0629",' +
+              '"\\u0627\\u0633\\u062a\\u0631\\u0627\\u062a\\u064a\\u062c\\u064a\\u0629",' +
+              '"\\u0625\\u0633\\u062a\\u0631\\u0627\\u062a\\u064a\\u062c\\u064a\\u0629",' +
+              '"\\u062d\\u0642\\u064a\\u0642\\u0629",' +
+              '"\\u062a\\u062d\\u0630\\u064a\\u0631",' +
+              '"\\u062e\\u0637\\u0623",' +
+              '"\\u0623\\u0631\\u0628\\u0627\\u062d",' +
+              '"\\u062e\\u0633\\u0627\\u0631\\u0629",' +
+              '"\\u0646\\u0645\\u0648",' +
+              '"\\u0635\\u0641\\u0642\\u0629",' +
+              '"\\u0627\\u0633\\u062a\\u062b\\u0645\\u0627\\u0631",' +
+              '"\\u0646\\u062a\\u064a\\u062c\\u0629"' +
+            ']',
+            '',
+            'digits_pct_pat = r"[0-9\\u0660-\\u0669]+|%|\\u066a"',
+            'qmark_pat = r"\\u061f|!"',
+            '',
+            'def build_pat(words):',
+            '    import re',
+            '    return "(?:" + "|".join(re.escape(w) for w in words) + ")"',
+            '',
+            'arabic_keywords = [',
+            '    build_pat(question_words),',
+            '    build_pat(superlatives),',
+            '    build_pat(topic_words),',
+            '    digits_pct_pat,',
+            '    qmark_pat',
+            ']',
+            'pat = re.compile("|".join(f"(?:{p})" for p in arabic_keywords))',
+            '',
+            'rows = []',
+            'for s in segs:',
+            '    txt = s["text"]',
+            '    score = 0.0',
+            '    score += len(pat.findall(txt))',
+            '    dur = s["end"] - s["start"]',
+            '    if 4.0 <= dur <= 25.0:',
+            '        score += 1.0',
+            '    if txt.endswith(("\\u061f","!",".")):',
+            '        score += 0.5',
+            '    rows.append({**s, "score": float(score), "dur": dur})',
+            '',
+            'df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False, True])'
+          )
+          $lines += $topLine
+          $lines += @(
+            'top = df.head(TOPN)',
+            '',
+            'top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)',
+            'with open("highlights.txt","w",encoding="utf-8") as f:',
+            '    for i, r in enumerate(top.itertuples(), 1):',
+            '        f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")'
+          )
+          [IO.File]::WriteAllText("score_ar.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
 
-with open("transcript.json","r",encoding="utf-8") as f:
-    segs = json.load(f)["segments"]
-
-arabic_keywords = [
-  r"لماذا|ليش|ليه|كيف|ماذا|شنو|ايش|شو|متى|أين|وين|من|كم|هل",
-  r"أفضل|أحسن|أكبر|أصغر|أهم|أقوى|أسرع|أغلى|أرخص|الأفضل|الأهم",
-  r"مشكلة|حل|سر|نصيحة|خدعة|طريقة|استراتيجية|إستراتيجية|حقيقة|تحذير|خطأ|أرباح|خسارة|نمو|صفقة|استثمار|نتيجة",
-  r"[0-9٠-٩]+|٪|%",
-  r"؟|!"
-]
-pat = re.compile("|".join(f"(?:{p})" for p in arabic_keywords))
-
-rows = []
-for s in segs:
-    txt = s["text"]
-    score = 0.0
-    score += len(pat.findall(txt))
-    dur = s["end"] - s["start"]
-    if 4.0 <= dur <= 25.0:
-        score += 1.0
-    if txt.endswith(("؟","!",".")):
-        score += 0.5
-    rows.append({**s, "score": float(score), "dur": dur})
-
-df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False,True])
-TOPN = int("@TOPN@")
-top = df.head(TOPN)
-
-top.to_json("highlights.json", orient="records", force_ascii=False, indent=2)
-with open("highlights.txt","w",encoding="utf-8") as f:
-    for i, r in enumerate(top.itertuples(), 1):
-        f.write(f"[{r.start:07.2f}-{r.end:07.2f}] (score={r.score:.1f}) {r.text}\n")
-'@
-          $code = $code.Replace("@TOPN@", $TOPN)
-          [IO.File]::WriteAllText("score_ar.py", $code, [Text.Encoding]::UTF8)
-
-      - name: Score highlights
+      - name: Score highlights (run)
         shell: powershell
         run: python score_ar.py
 
+      # --------- Write export_clips.py (no braces formatting) ---------
       - name: Write export_clips.py
         shell: powershell
         run: |
           $PAD_PRE  = '${{ inputs.padPre }}'
           $PAD_POST = '${{ inputs.padPost }}'
-          $code = @'
-import json, os, subprocess
+          $linePre  = 'PAD_PRE = float("' + $PAD_PRE  + '")'
+          $linePost = 'PAD_POST = float("' + $PAD_POST + '")'
+          $lines = @(
+            'import json, os, subprocess',
+            $linePre,
+            $linePost,
+            '',
+            'with open("highlights.json","r",encoding="utf-8") as f:',
+            '    segs = json.load(f)',
+            '',
+            'os.makedirs("clips", exist_ok=True)',
+            'for i, s in enumerate(segs, 1):',
+            '    ss = max(0.0, s["start"] - PAD_PRE)',
+            '    to = max(0.1, (s["end"] + PAD_POST) - ss)',
+            '    out = f"clips/clip_{i:02d}.mp4"',
+            '    cmd = [',
+            '        "ffmpeg","-y",',
+            '        "-ss", f"{ss:.3f}", "-i", "input.mp4",',
+            '        "-t", f"{to:.3f}",',
+            '        "-c:v","libx264","-preset","veryfast","-crf","22",',
+            '        "-c:a","aac","-b:a","128k",',
+            '        out',
+            '    ]',
+            '    subprocess.run(cmd, check=True)'
+          )
+          [IO.File]::WriteAllText("export_clips.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
 
-PAD_PRE = float("@PAD_PRE@")
-PAD_POST = float("@PAD_POST@")
-
-with open("highlights.json","r",encoding="utf-8") as f:
-    segs = json.load(f)
-
-os.makedirs("clips", exist_ok=True)
-for i, s in enumerate(segs, 1):
-    ss = max(0.0, s["start"] - PAD_PRE)
-    to = max(0.1, (s["end"] + PAD_POST) - ss)
-    out = f"clips/clip_{i:02d}.mp4"
-    cmd = [
-        "ffmpeg","-y",
-        "-ss", f"{ss:.3f}", "-i", "input.mp4",
-        "-t", f"{to:.3f}",
-        "-c:v","libx264","-preset","veryfast","-crf","22",
-        "-c:a","aac","-b:a","128k",
-        out
-    ]
-    subprocess.run(cmd, check=True)
-'@
-          $code = $code.Replace("@PAD_PRE@", $PAD_PRE).Replace("@PAD_POST@", $PAD_POST)
-          [IO.File]::WriteAllText("export_clips.py", $code, [Text.Encoding]::UTF8)
-
-      - name: Export highlight clips
+      - name: Export highlight clips (run)
         shell: powershell
         run: python export_clips.py
 
-      - name: Upload artifacts
+      - name: Upload artifacts (formats, transcript, highlights, clips)
         uses: actions/upload-artifact@v4
         with:
           name: highlights-output
