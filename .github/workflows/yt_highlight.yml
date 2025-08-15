@@ -246,20 +246,20 @@ jobs:
             '',
             '# Arabic keyword lists encoded as \\uXXXX to avoid encoding issues',
             'question_words = [' +
-              '"\\u0644\\u0645\\u0627\\u0630\\u0627",' +  # لماذا
-              '"\\u0644\\u064a\\u0634",' +                # ليش
-              '"\\u0644\\u064a\\u0647",' +                # ليه
-              '"\\u0643\\u064a\\u0641",' +                # كيف
-              '"\\u0645\\u0627\\u0630\\u0627",' +        # ماذا
-              '"\\u0634\\u0646\\u0648",' +                # شنو
-              '"\\u0627\\u064a\\u0634",' +                # ايش
-              '"\\u0634\\u0648",' +                      # شو
-              '"\\u0645\\u062a\\u0649",' +                # متى
-              '"\\u0623\\u064a\\u0646",' +                # أين
-              '"\\u0648\\u064a\\u0646",' +                # وين
-              '"\\u0645\\u0646",' +                      # من
-              '"\\u0643\\u0645",' +                      # كم
-              '"\\u0647\\u0644"' +                       # هل
+              '"\\u0644\\u0645\\u0627\\u0630\\u0627",' +
+              '"\\u0644\\u064a\\u0634",' +
+              '"\\u0644\\u064a\\u0647",' +
+              '"\\u0643\\u064a\\u0641",' +
+              '"\\u0645\\u0627\\u0630\\u0627",' +
+              '"\\u0634\\u0646\\u0648",' +
+              '"\\u0627\\u064a\\u0634",' +
+              '"\\u0634\\u0648",' +
+              '"\\u0645\\u062a\\u0649",' +
+              '"\\u0623\\u064a\\u0646",' +
+              '"\\u0648\\u064a\\u0646",' +
+              '"\\u0645\\u0646",' +
+              '"\\u0643\\u0645",' +
+              '"\\u0647\\u0644"' +
             ']',
             'superlatives = [' +
               '"\\u0623\\u0641\\u0636\\u0644",' +
@@ -322,6 +322,7 @@ jobs:
             '        score += 0.5',
             '    rows.append({**s, "score": float(score), "dur": dur})',
             '',
+            'import pandas as pd',
             'df = pd.DataFrame(rows).sort_values(["score","dur"], ascending=[False, True])'
           )
           $lines += $topLine
@@ -339,7 +340,141 @@ jobs:
         shell: powershell
         run: python score_ar.py
 
-      # --------- Write export_clips.py (no braces formatting) ---------
+      # --------- NEW: write propose_clips_v2.py (sliding 30–60s windows) ---------
+      - name: Write propose_clips_v2.py
+        shell: powershell
+        run: |
+          $lines = @(
+            'import json, argparse',
+            '',
+            'def hhmmss(t):',
+            '    h=int(t//3600); m=int((t%3600)//60); s=t-60*m-3600*h',
+            '    return f"{h:02d}:{m:02d}:{s:06.3f}"',
+            '',
+            'ap = argparse.ArgumentParser()',
+            'ap.add_argument("--transcript", default="transcript.json")',
+            'ap.add_argument("--min-seconds", type=float, default=30.0)',
+            'ap.add_argument("--max-seconds", type=float, default=60.0)',
+            'ap.add_argument("--step", type=float, default=2.0)',
+            'ap.add_argument("--top-n", type=int, default=20)',
+            'ap.add_argument("--out", default="out/candidates.json")',
+            'args = ap.parse_args()',
+            '',
+            'data = json.load(open(args.transcript,"r",encoding="utf-8"))',
+            'segs = data.get("segments", [])',
+            'T = segs[-1]["end"] if segs else 0.0',
+            '',
+            'import os; os.makedirs("out", exist_ok=True)',
+            'cands = []',
+            't = 0.0',
+            'while t + args.min_seconds <= T:',
+            '    w_start, w_end = t, min(t + args.max_seconds, T)',
+            '    inside = [s for s in segs if s["start"] < w_end and s["end"] > w_start]',
+            '    if not inside: t += args.step; continue',
+            '    text = " ".join(s["text"] for s in inside)',
+            '    dur = w_end - w_start',
+            '    if dur < args.min_seconds: t += args.step; continue',
+            '    # simple features: length fit + punctuation end + density',
+            '    mid = 0.5*(args.min_seconds + args.max_seconds)',
+            '    len_fit = max(0.0, 1.0 - abs(dur-mid)/mid)',
+            '    punct_end = 1.0 if (text.strip().endswith(("؟","?","!","."))) else 0.0',
+            '    words = len(text.split())',
+            '    density = min(1.0, words/max(1.0,dur)/3.0)  # ~3 w/s target',
+            '    score = 1.2*len_fit + 0.6*punct_end + 0.6*density',
+            '    cands.append({',
+            '        "id": f"cand_{len(cands)+1:04d}",',
+            '        "start": hhmmss(w_start), "end": hhmmss(w_end),',
+            '        "text": text[:900], "score": round(score,3),',
+            '        "features": {',
+            '            "length_fit": round(len_fit,3), "punct_end": punct_end, "density": round(density,3)',
+            '        },',
+            '        "reason": f"len_fit={len_fit:.2f}, punct_end={punct_end:.0f}, density={density:.2f}"',
+            '    })',
+            '    t += args.step',
+            '',
+            'cands.sort(key=lambda x: x["score"], reverse=True)',
+            '# keep top-N with spacing (>=20s apart by start time)',
+            'def tosec(hms):',
+            '    h,m,s = hms.split(":"); return int(h)*3600 + int(m)*60 + float(s)',
+            'chosen, used = [], []',
+            'for c in cands:',
+            '    cs = tosec(c["start"])',
+            '    if any(abs(cs-u)<20 for u in used):',
+            '        continue',
+            '    chosen.append(c); used.append(cs)',
+            '    if len(chosen)>=args.top_n: break',
+            '',
+            'json.dump(chosen, open(args.out,"w",encoding="utf-8"), ensure_ascii=False, indent=2)',
+            'print(f"Wrote {args.out} ({len(chosen)} candidates)")'
+          )
+          [IO.File]::WriteAllText("propose_clips_v2.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
+
+      - name: Propose top candidates (heuristics v2)
+        shell: powershell
+        run: |
+          mkdir out -Force | Out-Null
+          python propose_clips_v2.py --transcript transcript.json --min-seconds 30 --max-seconds 60 --top-n 20 --out out/candidates.json
+
+      # --------- NEW: write rerank_with_llm.py (Ollama optional; safe fallback) ---------
+      - name: Write rerank_with_llm.py
+        shell: powershell
+        run: |
+          $lines = @(
+            'import json, argparse, subprocess, textwrap, sys, os',
+            'MODEL = os.environ.get("OLLAMA_MODEL","qwen2:1.5b-instruct")',
+            'def ollama_run(prompt: str) -> str:',
+            '    try:',
+            '        p = subprocess.run(["ollama","run",MODEL], input=prompt.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)',
+            '        return p.stdout.decode("utf-8","ignore")',
+            '    except Exception as e:',
+            '        print(f"[LLM fallback] {e}", file=sys.stderr); return ""',
+            'ap = argparse.ArgumentParser()',
+            'ap.add_argument("--candidates", required=True)',
+            'ap.add_argument("--out", default="out/approved_clips.json")',
+            'ap.add_argument("--take-top", type=int, default=3)',
+            'args = ap.parse_args()',
+            'cands = json.load(open(args.candidates,"r",encoding="utf-8"))',
+            'items = [{"id":c["id"],"start":c["start"],"end":c["end"],"text":c.get("text",""),"score":c.get("score",0.0)} for c in cands[:20]]',
+            'prompt = textwrap.dedent(f"""',
+            'أنت محرّر لمقاطع بودكاست عربي قصيرة (Shorts/Reels).',
+            'اختر الأفضل (٣–٥) بناءً على: خطّاف في أول ٣ ثوانٍ، قيمة/إجابة واضحة، نهاية مريحة، تنوّع بالمواضيع.',
+            'أعد JSON فقط:',
+            '[',
+            '  {{"id":"...","start":"HH:MM:SS.mmm","end":"HH:MM:SS.mmm","title":"عنوان قصير","reason":"سبب الاختيار"}}',
+            ']',
+            'المرشحون:',
+            '{json.dumps(items, ensure_ascii=False, indent=2)}',
+            '""").strip()',
+            'raw = ollama_run(prompt)',
+            'start = raw.find("["); end = raw.rfind("]")',
+            'approved = []',
+            'if start!=-1 and end!=-1:',
+            '    try: approved = json.loads(raw[start:end+1])',
+            '    except Exception: approved = []',
+            'if not approved:',
+            '    # fallback: top by score',
+            '    approved = [{"id":it["id"],"start":it["start"],"end":it["end"],"title":f"مقطع #{i+1}","reason":"Fallback: أعلى نتيجة"} for i,it in enumerate(items[:args.take_top])]',
+            'os.makedirs("out", exist_ok=True)',
+            'with open(args.out,"w",encoding="utf-8") as f: json.dump(approved,f,ensure_ascii=False,indent=2)',
+            'print(f"Wrote {args.out} with {len(approved)} clips.")'
+          )
+          [IO.File]::WriteAllText("rerank_with_llm.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
+
+      - name: (Optional) Pull local LLM (Ollama) for re-rank
+        shell: powershell
+        continue-on-error: true
+        run: |
+          if (Get-Command ollama -ErrorAction SilentlyContinue) {
+            ollama pull qwen2:1.5b-instruct
+          } else {
+            Write-Host "Ollama not found; rerank will use fallback (top by score)."
+          }
+
+      - name: Re-rank candidates with local LLM (or fallback)
+        shell: powershell
+        run: python rerank_with_llm.py --candidates out/candidates.json --out out/approved_clips.json
+
+      # --------- Write export_clips.py (now prefers approved_clips.json) ---------
       - name: Write export_clips.py
         shell: powershell
         run: |
@@ -348,17 +483,32 @@ jobs:
           $linePre  = 'PAD_PRE = float("' + $PAD_PRE  + '")'
           $linePost = 'PAD_POST = float("' + $PAD_POST + '")'
           $lines = @(
-            'import json, os, subprocess',
+            'import json, os, subprocess, sys',
             $linePre,
             $linePost,
             '',
-            'with open("highlights.json","r",encoding="utf-8") as f:',
-            '    segs = json.load(f)',
+            'def read_candidates():',
+            '    if os.path.exists("out/approved_clips.json"):',
+            '        return json.load(open("out/approved_clips.json","r",encoding="utf-8"))',
+            '    elif os.path.exists("highlights.json"):',
+            '        # fallback: use segment-level highlights from score_ar.py',
+            '        hs = json.load(open("highlights.json","r",encoding="utf-8"))',
+            '        # convert to same shape (use exact start/end)',
+            '        res = []',
+            '        for i,h in enumerate(hs,1):',
+            '            res.append({"id": f"seg_{i:02d}", "start": h["start"], "end": h["end"], "title": f"Highlight {i}"})',
+            '        return res',
+            '    else:',
+            '        print("No approved_clips.json or highlights.json found.", file=sys.stderr); sys.exit(1)',
             '',
+            'def tosec(hms):',
+            '    h,m,s = hms.split(":"); return int(h)*3600 + int(m)*60 + float(s)',
+            '',
+            'clips = read_candidates()',
             'os.makedirs("clips", exist_ok=True)',
-            'for i, s in enumerate(segs, 1):',
-            '    ss = max(0.0, s["start"] - PAD_PRE)',
-            '    to = max(0.1, (s["end"] + PAD_POST) - ss)',
+            'for i, c in enumerate(clips, 1):',
+            '    ss = max(0.0, tosec(c["start"]) - PAD_PRE)',
+            '    to = max(0.1, (tosec(c["end"]) + PAD_POST) - ss)',
             '    out = f"clips/clip_{i:02d}.mp4"',
             '    cmd = [',
             '        "ffmpeg","-y",',
@@ -368,6 +518,7 @@ jobs:
             '        "-c:a","aac","-b:a","128k",',
             '        out',
             '    ]',
+            '    print("+"," ".join(cmd))',
             '    subprocess.run(cmd, check=True)'
           )
           [IO.File]::WriteAllText("export_clips.py", ($lines -join "`r`n"), [Text.Encoding]::UTF8)
@@ -388,5 +539,7 @@ jobs:
             transcript.srt
             highlights.json
             highlights.txt
+            out/candidates.json
+            out/approved_clips.json
             clips/*.mp4
           if-no-files-found: warn
