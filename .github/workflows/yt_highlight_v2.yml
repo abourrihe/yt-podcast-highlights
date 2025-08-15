@@ -1,0 +1,132 @@
+name: YouTube Highlights v2 (Windows + Firefox, Arabic E2E)
+
+on:
+  workflow_dispatch:
+    inputs:
+      videoId:
+        description: "YouTube Video ID (e.g., S9a1nLw70p0)"
+        required: true
+        type: string
+      profile:
+        description: 'Firefox profile from about:profiles (e.g., "yov4tydr.default-release-3")'
+        required: true
+        default: "yov4tydr.default-release-3"
+        type: string
+      whisper_model:
+        description: "Whisper model (bigger = better but slower)"
+        required: true
+        default: "medium"
+        type: choice
+        options: [small, medium, large-v3]
+      max_clip_len:
+        description: "Max seconds per clip"
+        required: true
+        default: "60"
+        type: string
+      use_ollama:
+        description: "Rerank with local Ollama if running"
+        required: true
+        default: "false"
+        type: choice
+        options: ["true","false"]
+      ollama_model:
+        description: "Ollama model (only used if use_ollama=true)"
+        required: false
+        default: "llama3.1:8b"
+        type: string
+
+jobs:
+  build:
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure FFmpeg
+        shell: powershell
+        run: |
+          choco install ffmpeg --yes --no-progress
+          ffmpeg -version
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: List formats (verify cookies)
+        shell: powershell
+        run: |
+          yt-dlp --cookies-from-browser firefox:${{ inputs.profile }} https://www.youtube.com/watch?v=${{ inputs.videoId }} -F | Tee-Object -FilePath list-formats.txt
+
+      - name: Download best MP4
+        shell: powershell
+        run: |
+          yt-dlp -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best" --merge-output-format mp4 ^
+            --cookies-from-browser firefox:${{ inputs.profile }} ^
+            -o "download.%(ext)s" https://www.youtube.com/watch?v=${{ inputs.videoId }}
+          $file = Get-ChildItem -Filter "download.*" | Select-Object -First 1
+          if (-not $file) { Write-Error "No output file found." ; exit 1 }
+          if ($file.Extension -ieq ".mp4") {
+            Copy-Item -Force -LiteralPath $file.FullName -Destination "input.mp4"
+          } else {
+            ffmpeg -y -i "$($file.FullName)" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
+          }
+
+      - name: Extract audio (16k mono)
+        shell: powershell
+        run: ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
+
+      - name: Transcribe (faster-whisper)
+        run: |
+          python scripts/process_video.py --stage transcribe --audio audio.wav --out_dir .
+
+      - name: Laughter detection
+        run: python scripts/detect_laughter.py --audio audio.wav --out out/laughter.json
+
+      - name: Propose clips (min=30s, max from input)
+        run: |
+          python scripts/propose_clips_v2.py --transcript transcript.json --laughter out/laughter.json --min_s 30 --max_s ${{ inputs.max_clip_len }} --topk 12 --out_json highlights.json --out_txt highlights.txt
+
+      - name: Optional rerank with Ollama
+        if: ${{ inputs.use_ollama == 'true' }}
+        run: |
+          python scripts/rerank_with_llm.py --inn highlights.json --out highlights_reranked.json --model "${{ inputs.ollama_model }}"
+          if exist highlights_reranked.json copy /Y highlights_reranked.json highlights.json
+
+      - name: Export top clips (burn subs)
+        shell: powershell
+        run: |
+          $json = Get-Content highlights.json -Raw | ConvertFrom-Json
+          $i = 0
+          foreach ($c in $json) {
+            $i += 1
+            $start = [string]::Format("{0:0.2}", $c.start)
+            $end = [string]::Format("{0:0.2}", $c.end)
+            python scripts/process_video.py --stage export --video input.mp4 --srt transcript.srt --start $start --end $end --out "clips\clip_$i.mp4"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: highlights-output
+          path: |
+            list-formats.txt
+            input.mp4
+            audio.wav
+            transcript.json
+            transcript.srt
+            highlights.json
+            highlights.txt
+            clips/*.mp4
+          if-no-files-found: warn
