@@ -1,5 +1,5 @@
 from typing import List
-from .utils import Segment, Clip
+from scripts.utils import Segment, Clip
 
 ARABIC_PUNCT = "،؛؟!,."
 
