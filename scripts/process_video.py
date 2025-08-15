@@ -1,3 +1,7 @@
+import os, sys
+# allow running as a plain script without -m by adding this folder to sys.path
+sys.path.append(os.path.dirname(__file__))
+
 import argparse, json, os, subprocess
 from typing import List
 from faster_whisper import WhisperModel
