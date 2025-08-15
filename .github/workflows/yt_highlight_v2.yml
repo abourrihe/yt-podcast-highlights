@@ -18,13 +18,28 @@ on:
         default: "medium"
         type: choice
         options: [small, medium, large-v3]
+      topk:
+        description: "How many highlight segments to export"
+        required: true
+        default: "8"
+        type: string
       max_clip_len:
         description: "Max seconds per clip"
         required: true
         default: "60"
         type: string
+      padding_before:
+        description: "Seconds padding before each clip"
+        required: true
+        default: "0.6"
+        type: string
+      padding_after:
+        description: "Seconds padding after each clip"
+        required: true
+        default: "0.6"
+        type: string
       use_ollama:
-        description: "Rerank with local Ollama if running"
+        description: "Rerank with local Ollama (must be running on the runner)"
         required: true
         default: "false"
         type: choice
@@ -38,17 +53,35 @@ on:
 jobs:
   build:
     runs-on: [self-hosted, Windows]
-    timeout-minutes: 120
+    timeout-minutes: 180
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure FFmpeg
+      # FFmpeg: use existing if present; otherwise try choco; if not available, fetch portable build
+      - name: Ensure FFmpeg (install only if missing)
         shell: powershell
         run: |
-          choco install ffmpeg --yes --no-progress
+          $ff = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          if (-not $ff) {
+            Write-Host "FFmpeg not found."
+            $ch = Get-Command choco -ErrorAction SilentlyContinue
+            if ($ch) {
+              Write-Host "Installing FFmpeg via Chocolatey..."
+              choco install ffmpeg --yes --no-progress --accept-license
+              $env:Path = "$env:Path;C:\ProgramData\chocolatey\bin;C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
+            } else {
+              Write-Host "Chocolatey not found; using portable FFmpeg..."
+              Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
+              Expand-Archive -Path "ffmpeg.zip" -DestinationPath ".\ffmpeg_portable" -Force
+              $dir = Get-ChildItem ".\ffmpeg_portable" -Directory | Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
+              if (-not $dir) { Write-Error "Portable FFmpeg unpack failed."; exit 1 }
+              "$PWD\$($dir.Name)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
           ffmpeg -version
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -59,7 +92,7 @@ jobs:
           path: ~\AppData\Local\pip\Cache
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -67,14 +100,15 @@ jobs:
       - name: List formats (verify cookies)
         shell: powershell
         run: |
-          yt-dlp --cookies-from-browser firefox:${{ inputs.profile }} https://www.youtube.com/watch?v=${{ inputs.videoId }} -F | Tee-Object -FilePath list-formats.txt
+          yt-dlp --cookies-from-browser "firefox:${{ inputs.profile }}" "https://www.youtube.com/watch?v=${{ inputs.videoId }}" -F `
+            | Tee-Object -FilePath list-formats.txt
 
       - name: Download best MP4
         shell: powershell
         run: |
-          yt-dlp -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best" --merge-output-format mp4 ^
-            --cookies-from-browser firefox:${{ inputs.profile }} ^
-            -o "download.%(ext)s" https://www.youtube.com/watch?v=${{ inputs.videoId }}
+          yt-dlp -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best" --merge-output-format mp4 `
+            --cookies-from-browser "firefox:${{ inputs.profile }}" `
+            -o "download.%(ext)s" "https://www.youtube.com/watch?v=${{ inputs.videoId }}"
           $file = Get-ChildItem -Filter "download.*" | Select-Object -First 1
           if (-not $file) { Write-Error "No output file found." ; exit 1 }
           if ($file.Extension -ieq ".mp4") {
@@ -83,11 +117,16 @@ jobs:
             ffmpeg -y -i "$($file.FullName)" -c:v libx264 -preset veryfast -crf 21 -c:a aac -b:a 160k input.mp4
           }
 
-      - name: Extract audio (16k mono)
+      - name: Extract audio to WAV (16k mono)
         shell: powershell
         run: ffmpeg -y -i "input.mp4" -vn -ac 1 -ar 16000 -c:a pcm_s16le "audio.wav"
 
       - name: Transcribe (faster-whisper)
+        env:
+          WHISPER_MODEL: ${{ inputs.whisper_model }}
+          WHISPER_BEAM: "1"
+          WHISPER_VAD: "1"
+          WHISPER_CHUNK: "30"
         run: |
           python scripts/process_video.py --stage transcribe --audio audio.wav --out_dir .
 
@@ -96,7 +135,14 @@ jobs:
 
       - name: Propose clips (min=30s, max from input)
         run: |
-          python scripts/propose_clips_v2.py --transcript transcript.json --laughter out/laughter.json --min_s 30 --max_s ${{ inputs.max_clip_len }} --topk 12 --out_json highlights.json --out_txt highlights.txt
+          python scripts/propose_clips_v2.py `
+            --transcript transcript.json `
+            --laughter out/laughter.json `
+            --min_s 30 `
+            --max_s ${{ inputs.max_clip_len }} `
+            --topk ${{ inputs.topk }} `
+            --out_json highlights.json `
+            --out_txt highlights.txt
 
       - name: Optional rerank with Ollama
         if: ${{ inputs.use_ollama == 'true' }}
@@ -104,16 +150,22 @@ jobs:
           python scripts/rerank_with_llm.py --inn highlights.json --out highlights_reranked.json --model "${{ inputs.ollama_model }}"
           if exist highlights_reranked.json copy /Y highlights_reranked.json highlights.json
 
-      - name: Export top clips (burn subs)
+      - name: Export top clips (burn subs, with padding)
         shell: powershell
         run: |
+          New-Item -ItemType Directory -Force -Path "clips" | Out-Null
           $json = Get-Content highlights.json -Raw | ConvertFrom-Json
+          $padBefore = [double]"${{ inputs.padding_before }}"
+          $padAfter  = [double]"${{ inputs.padding_after }}"
           $i = 0
           foreach ($c in $json) {
             $i += 1
-            $start = [string]::Format("{0:0.2}", $c.start)
-            $end = [string]::Format("{0:0.2}", $c.end)
-            python scripts/process_video.py --stage export --video input.mp4 --srt transcript.srt --start $start --end $end --out "clips\clip_$i.mp4"
+            $start = [double]$c.start - $padBefore
+            if ($start -lt 0) { $start = 0 }
+            $end   = [double]$c.end + $padAfter
+            $startStr = [string]::Format("{0:0.2}", $start)
+            $endStr   = [string]::Format("{0:0.2}", $end)
+            python scripts/process_video.py --stage export --video input.mp4 --srt transcript.srt --start $startStr --end $endStr --out "clips\clip_$i.mp4"
           }
 
       - name: Upload artifacts
