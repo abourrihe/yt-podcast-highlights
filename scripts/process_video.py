@@ -2,16 +2,24 @@ import os, sys
 # allow running as a plain script without -m by adding this folder to sys.path
 sys.path.append(os.path.dirname(__file__))
 
-import argparse, json, os, subprocess
+import argparse, json, subprocess
 from typing import List
 from faster_whisper import WhisperModel
 import pysrt
-from utils import Segment
-from scoring import choose_clip
+
+# Robust imports — works with or without -m
+try:
+    from .utils import Segment
+    from .scoring import choose_clip
+except ImportError:
+    from utils import Segment
+    from scoring import choose_clip
+
 
 def run(cmd: list[str]):
     print('+', ' '.join(cmd), flush=True)
     subprocess.check_call(cmd)
+
 
 def transcribe(path: str, lang_hint: str = 'ar') -> List[Segment]:
     model = WhisperModel("large-v3", device="cpu", compute_type="int8")
@@ -21,14 +29,21 @@ def transcribe(path: str, lang_hint: str = 'ar') -> List[Segment]:
         out.append(Segment(float(seg.start), float(seg.end), seg.text.strip(), seg.avg_logprob))
     return out
 
+
 def write_srt(segments: List[Segment], srt_path: str):
     subs = pysrt.SubRipFile()
+
     def fmt(t):
-        h = int(t // 3600); m = int((t % 3600)//60); s = int(t%60); ms = int((t - int(t))*1000)
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        ms = int((t - int(t)) * 1000)
         return pysrt.SubRipTime(hours=h, minutes=m, seconds=s, milliseconds=ms)
+
     for i, s in enumerate(segments, 1):
         subs.append(pysrt.SubRipItem(index=i, start=fmt(s.start), end=fmt(s.end), text=s.text))
     subs.save(srt_path, encoding='utf-8')
+
 
 def burn_subs(in_path: str, out_path: str, srt_path: str, font_path: str,
               logo_path: str | None, end_slate: str | None):
@@ -36,13 +51,14 @@ def burn_subs(in_path: str, out_path: str, srt_path: str, font_path: str,
     if logo_path and os.path.exists(logo_path):
         vf.append("movie='{}',scale=iw*0.12:-1 [logo]; [in][logo] overlay=W-w-30:30 [out]".format(logo_path))
     vf_filt = ','.join(vf)
-    run(['ffmpeg','-y','-i', in_path, '-vf', vf_filt,
-         '-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','128k', out_path])
+    run(['ffmpeg', '-y', '-i', in_path, '-vf', vf_filt,
+         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', out_path])
     if end_slate and os.path.exists(end_slate):
-        tmp = out_path.replace('.mp4','_with_end.mp4')
-        run(['ffmpeg','-y','-i', out_path, '-i', end_slate, '-filter_complex',
-             '[0:v][1:v]concat=n=2:v=1:a=0', '-c:v','libx264','-preset','veryfast','-crf','23', tmp])
+        tmp = out_path.replace('.mp4', '_with_end.mp4')
+        run(['ffmpeg', '-y', '-i', out_path, '-i', end_slate, '-filter_complex',
+             '[0:v][1:v]concat=n=2:v=1:a=0', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', tmp])
         os.replace(tmp, out_path)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -58,14 +74,17 @@ def main():
     args = ap.parse_args()
 
     segs = transcribe(args.input, lang_hint=args.lang)
-    clip = choose_clip(segs, args.min_seconds, args.max_seconds,
-                       [k.strip() for k in args.keywords_prefer.split(',') if k.strip()],
-                       [k.strip() for k in args.keywords_avoid.split(',') if k.strip()])
+    clip = choose_clip(
+        segs, args.min_seconds, args.max_seconds,
+        [k.strip() for k in args.keywords_prefer.split(',') if k.strip()],
+        [k.strip() for k in args.keywords_avoid.split(',') if k.strip()]
+    )
     if not clip:
         raise SystemExit('no suitable clip found')
 
     out_clip = 'clip.mp4'
-    run(['ffmpeg','-y','-ss', f"{clip.start}", '-i', args.input, '-to', f"{clip.end-clip.start}", '-c','copy', out_clip])
+    run(['ffmpeg', '-y', '-ss', f"{clip.start}", '-i', args.input,
+         '-to', f"{clip.end - clip.start}", '-c', 'copy', out_clip])
 
     sub_segments = [s for s in segs if s.start < clip.end and s.end > clip.start]
     for s in sub_segments:
@@ -84,8 +103,9 @@ def main():
         'text': clip.text,
         'channel': os.getenv('GITHUB_REPOSITORY', '').split('/')[-1]
     }
-    with open('artifact.json','w',encoding='utf-8') as f:
-        import json; json.dump(meta, f, ensure_ascii=False)
+    with open('artifact.json', 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False)
+
 
 if __name__ == '__main__':
     main()
