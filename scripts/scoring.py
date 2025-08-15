@@ -1,5 +1,6 @@
 from typing import List
 
+# Robust import whether run as package (python -m ...) or as a plain script
 try:
     from .utils import Segment, Clip
 except ImportError:
@@ -18,14 +19,16 @@ def score_window(tokens: List[str], prefer: set[str], avoid: set[str]) -> float:
     return score
 
 def choose_clip(segments: List[Segment], min_s: int, max_s: int,
-                prefer_kw: List[str], avoid_kw: List[str]) -> Clip | None:
-    prefer = set(prefer_kw)
-    avoid = set(avoid_kw)
+                prefer: set[str] | None = None, avoid: set[str] | None = None) -> Clip:
+    prefer = prefer or set()
+    avoid = avoid or set()
     best = (-1e9, None)
+
+    # sliding window over segments
     n = len(segments)
     for i in range(n):
+        start = segments[i].start
         for j in range(i, n):
-            start = segments[i].start
             end = segments[j].end
             dur = end - start
             if dur < min_s or dur > max_s:
@@ -33,7 +36,8 @@ def choose_clip(segments: List[Segment], min_s: int, max_s: int,
             text = ' '.join(s.text for s in segments[i:j+1])
             toks = [w.strip(ARABIC_PUNCT).lower() for w in text.split()]
             sc = score_window(toks, prefer, avoid)
-            center_bias = -0.0005 * ((start + end) / 2.0)  # avoid intros/outros
+            # prefer middle of the podcast a tiny bit (avoid long intros/outros)
+            center_bias = -0.0005 * ((start + end) / 2.0)
             sc += center_bias
             lp = [s.avg_logprob for s in segments[i:j+1] if s.avg_logprob is not None]
             if lp:
