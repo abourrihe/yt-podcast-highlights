@@ -1,5 +1,14 @@
+import os, sys
+# allow running as a plain script without -m by adding this folder to sys.path
+sys.path.append(os.path.dirname(__file__))
+
+import argparse, json, os as _os, subprocess
 from typing import List
-from scripts.utils import Segment, Clip
+from faster_whisper import WhisperModel
+import pysrt
+from utils import Segment           # <- now resolves in both modes
+from scoring import choose_clip
+
 
 ARABIC_PUNCT = "،؛؟!,."
 
