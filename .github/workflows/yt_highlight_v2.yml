@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # FFmpeg: use existing if present; otherwise try choco; if not available, fetch portable build
+      # FFmpeg: use existing if present; otherwise try choco; else fetch portable build
       - name: Ensure FFmpeg (install only if missing)
         shell: powershell
         run: |
@@ -128,14 +128,14 @@ jobs:
           WHISPER_VAD: "1"
           WHISPER_CHUNK: "30"
         run: |
-          python scripts/process_video.py --stage transcribe --audio audio.wav --out_dir .
+          python -m scripts.process_video --stage transcribe --audio audio.wav --out_dir .
 
       - name: Laughter detection
-        run: python scripts/detect_laughter.py --audio audio.wav --out out/laughter.json
+        run: python -m scripts.detect_laughter --audio audio.wav --out out/laughter.json
 
       - name: Propose clips (min=30s, max from input)
         run: |
-          python scripts/propose_clips_v2.py `
+          python -m scripts.propose_clips_v2 `
             --transcript transcript.json `
             --laughter out/laughter.json `
             --min_s 30 `
@@ -147,7 +147,7 @@ jobs:
       - name: Optional rerank with Ollama
         if: ${{ inputs.use_ollama == 'true' }}
         run: |
-          python scripts/rerank_with_llm.py --inn highlights.json --out highlights_reranked.json --model "${{ inputs.ollama_model }}"
+          python -m scripts.rerank_with_llm --inn highlights.json --out highlights_reranked.json --model "${{ inputs.ollama_model }}"
           if exist highlights_reranked.json copy /Y highlights_reranked.json highlights.json
 
       - name: Export top clips (burn subs, with padding)
@@ -165,7 +165,7 @@ jobs:
             $end   = [double]$c.end + $padAfter
             $startStr = [string]::Format("{0:0.2}", $start)
             $endStr   = [string]::Format("{0:0.2}", $end)
-            python scripts/process_video.py --stage export --video input.mp4 --srt transcript.srt --start $startStr --end $endStr --out "clips\clip_$i.mp4"
+            python -m scripts.process_video --stage export --video input.mp4 --srt transcript.srt --start $startStr --end $endStr --out "clips\clip_$i.mp4"
           }
 
       - name: Upload artifacts
